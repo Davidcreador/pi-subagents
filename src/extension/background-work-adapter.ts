@@ -13,8 +13,9 @@ export async function executeDetachableSubagent(input:{pi:ExtensionAPI;id:string
  const startedAt=Date.now();
  const file=input.ctx.sessionManager.getSessionFile();
  const sessionId=file?hash(file,16):`ephemeral-${process.pid}`;
- const missionId=process.env.AGENT_HARNESS_MISSION_ID;
- const jobId=`bg-${hash(`${sessionId}:${missionId??"ordinary"}:${input.id}`,8)}`;
+ // Group isolation id: generic env first, harness advisor alias second.
+ const groupId=process.env.PI_BACKGROUND_WORK_GROUP_ID??process.env.AGENT_HARNESS_MISSION_ID;
+ const jobId=`bg-${hash(`${sessionId}:${groupId??"ordinary"}:${input.id}`,8)}`;
  const controller=new AbortController();
  const backgroundSignal=Object.assign(controller.signal,{backgroundWorkSessionId:sessionId}) as AbortSignal&{backgroundWorkPromoted?:boolean;backgroundWorkSessionId:string};
  let phase:"foreground"|"promoted"|"completed"="foreground", release!:()=>void;
@@ -26,7 +27,7 @@ export async function executeDetachableSubagent(input:{pi:ExtensionAPI;id:string
  const mode=Array.isArray(input.params.chain)?"chain":Array.isArray(input.params.tasks)?"parallel":"single";
  const label=mode==="single"?String(input.params.agent??"subagent"):`${mode} (${Array.isArray(input.params.chain)?input.params.chain.length:(input.params.tasks as unknown[]).length})`;
  const completion=outcome.then(done=>{const finishedAt=Date.now();if(!done.ok)return{jobId,status:controller.signal.aborted?"cancelled" as const:"failed" as const,finishedAt,durationMs:finishedAt-startedAt,summary:`Subagent ${mode} failed.`,error:done.error instanceof Error?done.error.message:String(done.error)};const failed=done.result.details.results.some(r=>typeof r.exitCode==="number"&&r.exitCode!==0);return{jobId,status:controller.signal.aborted?"cancelled" as const:done.result.details.timedOut?"timed-out" as const:failed?"failed" as const:"succeeded" as const,finishedAt,durationMs:finishedAt-startedAt,summary:`Subagent ${mode} completed (${done.result.details.results.length} result(s)).`,output:text(done.result),artifactPath:done.result.details.truncation?.artifactPath??done.result.details.artifacts?.dir}});
- const inspect=()=>({jobId,sessionId,missionId,toolCallId:input.id,toolName:"subagent",kind:"subagent" as const,label,startedAt,state:phase==="promoted"?"background-running" as const:"foreground-running" as const,mutationRisk:"unknown" as const,latestOutput});
+ const inspect=()=>({jobId,sessionId,groupId,toolCallId:input.id,toolName:"subagent",kind:"subagent" as const,label,startedAt,state:phase==="promoted"?"background-running" as const:"foreground-running" as const,mutationRisk:"unknown" as const,latestOutput});
  input.pi.events.emit(REGISTER,{protocolVersion:VERSION,adapterInstanceId,...inspect(),promote(){if(phase!=="foreground")return{promoted:false,jobId};phase="promoted";backgroundSignal.backgroundWorkPromoted=true;input.signal.removeEventListener("abort",outerAbort);release();return{promoted:true,jobId}},cancel(){const reason=Object.assign(new Error("Background subagent hard cancelled"),{backgroundWorkHardCancel:true});controller.abort(reason)},inspect,completion});
  const winner=await Promise.race([outcome.then(value=>({type:"outcome" as const,value})),promoted.then(()=>({type:"promoted" as const}))]);
  if(winner.type==="promoted")return{content:[{type:"text",text:`Backgrounded top-level subagent run as ${jobId}. Inspect with /background-jobs.`}],details:{mode:"management",results:[],backgroundWork:{jobId,state:"background"}}};
