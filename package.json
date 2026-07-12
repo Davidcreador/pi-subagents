@@ -32,7 +32,8 @@
     "skills/**/*",
     "prompts/**/*",
     "README.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "scripts": {
     "test": "npm run test:unit",
