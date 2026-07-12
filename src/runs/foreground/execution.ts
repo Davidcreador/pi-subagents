@@ -48,7 +48,8 @@ import { buildAgentMemoryInjection } from "../../agents/agent-memory.ts";
 import { evaluateCompletionMutationGuard } from "../shared/completion-guard.ts";
 import { getPiSpawnCommand } from "../shared/pi-spawn.ts";
 import { createJsonlWriter } from "../../shared/jsonl-writer.ts";
-import { attachPostExitStdioGuard, trySignalChild } from "../../shared/post-exit-stdio-guard.ts";
+import { attachPostExitStdioGuard } from "../../shared/post-exit-stdio-guard.ts";
+import { backgroundWorkSupervisorState, foregroundSpawnDetached, isBackgroundWorkPromoted, shouldDetachForIntercomAbort, signalForegroundProcessTree } from "./process-group.ts";
 import { applyThinkingSuffix, buildPiArgs, cleanupTempDir } from "../shared/pi-args.ts";
 import { readStructuredOutput } from "../shared/structured-output.ts";
 import { captureSingleOutputSnapshot, formatSavedOutputReference, injectOutputPathSystemPrompt, resolveSingleOutput, validateFileOnlyOutputMode, type SingleOutputSnapshot } from "../shared/single-output.ts";
@@ -294,6 +295,7 @@ async function runSingleAttempt(
 			env: spawnEnv,
 			stdio: ["ignore", "pipe", "pipe"],
 			windowsHide: true,
+			detached: foregroundSpawnDetached(),
 		});
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
 		let buf = "";
@@ -374,7 +376,7 @@ async function runSingleAttempt(
 			if (childExited || finalDrainTimer || settled || processClosed || detached) return;
 			finalDrainTimer = setTimeout(() => {
 				if (settled || processClosed || detached) return;
-				const termSent = trySignalChild(proc, "SIGTERM");
+				const termSent = signalForegroundProcessTree(proc, "SIGTERM");
 				if (!termSent) return;
 				forcedTerminationSignal = true;
 				if (!cleanTerminalAssistantStopReceived && !assistantError) {
@@ -382,7 +384,7 @@ async function runSingleAttempt(
 				}
 				finalHardKillTimer = setTimeout(() => {
 					if (settled || processClosed || detached) return;
-					forcedTerminationSignal = trySignalChild(proc, "SIGKILL") || forcedTerminationSignal;
+					forcedTerminationSignal = signalForegroundProcessTree(proc, "SIGKILL") || forcedTerminationSignal;
 				}, HARD_KILL_MS);
 				finalHardKillTimer.unref?.();
 			}, FINAL_STOP_GRACE_MS);
@@ -391,6 +393,7 @@ async function runSingleAttempt(
 
 		const unsubscribeIntercomDetach = options.intercomEvents?.on?.(INTERCOM_DETACH_REQUEST_EVENT, (payload) => {
 			if (!options.allowIntercomDetach || detached || processClosed || !intercomStarted) return;
+			if (isBackgroundWorkPromoted(options.signal)) return;
 			if (!payload || typeof payload !== "object") return;
 			const requestId = (payload as { requestId?: unknown }).requestId;
 			if (typeof requestId !== "string" || requestId.length === 0) return;
@@ -410,6 +413,7 @@ async function runSingleAttempt(
 				activityTimer = undefined;
 			}
 			unsubscribeIntercomDetach?.();
+			setBackgroundSupervisorPending(false);
 			removeAbortListener?.();
 			removeInterruptListener?.();
 			resolve(code);
@@ -423,6 +427,13 @@ async function runSingleAttempt(
 		};
 
 		let activeLongRunningNotified = false;
+		let backgroundSupervisorRequestId: string | undefined;
+		const setBackgroundSupervisorPending = (pending: boolean, requestId = backgroundSupervisorRequestId) => {
+			if (!requestId) return;
+			if (pending) backgroundSupervisorRequestId = requestId;
+			options.intercomEvents?.emit("background-work:v1:supervisor-state", backgroundWorkSupervisorState(options.signal, pending, requestId));
+			if (!pending) backgroundSupervisorRequestId = undefined;
+		};
 		let pendingToolResult: { tool: string; path?: string; mutates: boolean; startedAt?: number } | undefined;
 		const mutatingFailures = createMutatingFailureState();
 		const mutatingFailureWindowMs = 5 * 60_000;
@@ -491,15 +502,15 @@ async function runSingleAttempt(
 			progress.error = message;
 			progress.durationMs = Date.now() - startTime;
 			fireUpdate();
-			trySignalChild(proc, "SIGINT");
+			signalForegroundProcessTree(proc, "SIGINT");
 			turnBudgetTerminationTimer = setTimeout(() => {
 				if (processClosed || settled || detached || result.timedOut) return;
-				trySignalChild(proc, "SIGTERM");
+				signalForegroundProcessTree(proc, "SIGTERM");
 			}, 1000);
 			turnBudgetTerminationTimer.unref?.();
 			turnBudgetHardKillTimer = setTimeout(() => {
 				if (processClosed || settled || detached || result.timedOut) return;
-				trySignalChild(proc, "SIGKILL");
+				signalForegroundProcessTree(proc, "SIGKILL");
 			}, 4000);
 			turnBudgetHardKillTimer.unref?.();
 		};
@@ -591,8 +602,11 @@ async function runSingleAttempt(
 				let shouldDetachForBlockingIntercom = false;
 				if (options.allowIntercomDetach && (evt.toolName === "intercom" || evt.toolName === "contact_supervisor")) {
 					intercomStarted = true;
-					shouldDetachForBlockingIntercom = (evt.toolName === "intercom" && toolArgs.action === "ask")
+					const blocking = (evt.toolName === "intercom" && toolArgs.action === "ask")
 						|| (evt.toolName === "contact_supervisor" && (toolArgs.reason === "need_decision" || toolArgs.reason === "interview_request"));
+					const promoted = isBackgroundWorkPromoted(options.signal);
+					shouldDetachForBlockingIntercom = blocking && !promoted;
+					if (blocking && promoted) setBackgroundSupervisorPending(true, `${options.runId ?? "run"}:${options.index}:${progress.toolCount + 1}`);
 				}
 				progress.toolCount++;
 				if (options.toolBudget) {
@@ -612,6 +626,7 @@ async function runSingleAttempt(
 			}
 
 			if (evt.type === "tool_execution_end") {
+				if (backgroundSupervisorRequestId && (progress.currentTool === "intercom" || progress.currentTool === "contact_supervisor")) setBackgroundSupervisorPending(false);
 				if (progress.currentTool) {
 					progress.recentTools.push({
 						tool: progress.currentTool,
@@ -716,15 +731,15 @@ async function runSingleAttempt(
 				progress.error = attemptTimeout.message;
 				progress.durationMs = Date.now() - startTime;
 				fireUpdate();
-				trySignalChild(proc, "SIGINT");
+				signalForegroundProcessTree(proc, "SIGINT");
 				timeoutTerminationTimer = setTimeout(() => {
 					if (processClosed || settled || detached) return;
-					trySignalChild(proc, "SIGTERM");
+					signalForegroundProcessTree(proc, "SIGTERM");
 				}, 1000);
 				timeoutTerminationTimer.unref?.();
 				timeoutHardKillTimer = setTimeout(() => {
 					if (processClosed || settled || detached) return;
-					trySignalChild(proc, "SIGKILL");
+					signalForegroundProcessTree(proc, "SIGKILL");
 				}, 4000);
 				timeoutHardKillTimer.unref?.();
 			}, attemptTimeout.remainingMs);
@@ -805,12 +820,12 @@ async function runSingleAttempt(
 		if (options.signal) {
 			const kill = () => {
 				if (processClosed || detached) return;
-				if (options.allowIntercomDetach && intercomStarted && !detached) {
+				if (shouldDetachForIntercomAbort(options.signal, options.allowIntercomDetach === true, intercomStarted) && !detached) {
 					detachForIntercom();
 					return;
 				}
-				proc.kill("SIGTERM");
-				setTimeout(() => !proc.killed && proc.kill("SIGKILL"), 3000);
+				signalForegroundProcessTree(proc, "SIGTERM");
+				setTimeout(() => !processClosed && signalForegroundProcessTree(proc, "SIGKILL"), 3000).unref?.();
 			};
 			if (options.signal.aborted) kill();
 			else {
@@ -831,10 +846,10 @@ async function runSingleAttempt(
 				result.finalOutput = "Interrupted. Waiting for explicit next action.";
 				progress.activityState = undefined;
 				fireUpdate();
-				trySignalChild(proc, "SIGINT");
+				signalForegroundProcessTree(proc, "SIGINT");
 				setTimeout(() => {
 					if (settled || processClosed || detached) return;
-					trySignalChild(proc, "SIGTERM");
+					signalForegroundProcessTree(proc, "SIGTERM");
 				}, 1000).unref?.();
 			};
 			if (options.interruptSignal.aborted) interrupt();

@@ -502,6 +502,7 @@ export interface SingleResult {
 }
 
 export interface Details {
+	backgroundWork?: { jobId: string; state: "background" };
 	mode: SubagentRunMode | "management";
 	runId?: string;
 	context?: "fresh" | "fork";

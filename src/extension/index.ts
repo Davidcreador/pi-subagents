@@ -42,6 +42,7 @@ import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
 import { loadConfig } from "./config.ts";
 import { buildSubagentToolDescription } from "./tool-description.ts";
+import { executeDetachableSubagent } from "./background-work-adapter.ts";
 import {
 	type Details,
 	type SubagentState,
@@ -241,6 +242,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	if (process.env[SUBAGENT_CHILD_ENV] === "1") {
 		return;
 	}
+	pi.events.emit("background-work:v1:adapter-ready", { protocolVersion: 1, toolName: "subagent", version: "0.34.0-background-work" });
 	const globalStore = globalThis as Record<string, unknown>;
 	const runtimeCleanupStoreKey = "__piSubagentRuntimeCleanup";
 	const previousRuntimeCleanup = globalStore[runtimeCleanupStoreKey];
@@ -459,7 +461,8 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		parameters: SubagentParams,
 
 		execute(id, params, signal, onUpdate, ctx) {
-			return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
+			if (params.async || params.action) return executeSubagentCollapsed(id, params, signal, onUpdate, ctx);
+			return executeDetachableSubagent({ pi, id, params, signal, onUpdate, ctx, execute: (jobSignal, jobUpdate) => executeSubagentCollapsed(id, params, jobSignal, jobUpdate, ctx) });
 		},
 
 		renderCall(args, theme) {
@@ -493,6 +496,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		},
 
 		renderResult(result, options, theme, context) {
+			if (result.details.backgroundWork) return new Text(`${theme.fg("muted", "↳ background")} ${theme.fg("accent", result.details.backgroundWork.jobId)}`, 0, 0);
 			if (subagentResultIsRunning(result)) {
 				ensureSubagentResultAnimation(context);
 			} else {
