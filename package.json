@@ -7,11 +7,11 @@
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/nicobailon/pi-subagents.git"
+    "url": "git+https://github.com/Davidcreador/pi-subagents.git"
   },
-  "homepage": "https://github.com/nicobailon/pi-subagents#readme",
+  "homepage": "https://github.com/Davidcreador/pi-subagents#readme",
   "bugs": {
-    "url": "https://github.com/nicobailon/pi-subagents/issues"
+    "url": "https://github.com/Davidcreador/pi-subagents/issues"
   },
   "keywords": [
     "pi-package",
@@ -77,5 +77,8 @@
     "@earendil-works/pi-agent-core": "0.74.0",
     "@earendil-works/pi-ai": "0.74.0",
     "@earendil-works/pi-coding-agent": "0.74.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.34.0-bg.0] (fork)
+
+Fork releases of `@davecodes/pi-subagents` on top of upstream v0.34.0.
+
+### Added
+- Foreground-run promotion: top-level `subagent` executions (single, parallel, chain) register as detachable work with the `pi-background-work` coordinator; `/background` promotes them without restarting anything.
+- Hard cancellation of promoted runs signals the entire foreground process group (`src/runs/foreground/process-group.ts`); Unix foreground spawns are now `detached` so group kills are possible.
+- Background-work protocol v1 `groupId` isolation via `PI_BACKGROUND_WORK_GROUP_ID` (harness `AGENT_HARNESS_MISSION_ID` honored as alias).
+
+### Changed
+- Package identity: `@davecodes/pi-subagents`, repository metadata points to the fork. No behavioral change when the coordinator extension is absent.
+
+
 ## [0.34.0] - 2026-07-07
 
 ### Added

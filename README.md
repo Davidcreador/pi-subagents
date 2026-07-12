@@ -1,3 +1,8 @@
+> [!NOTE]
+> **Fork** of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents) (base: v0.34.0), published as `@davecodes/pi-subagents`.
+> It adds exactly one capability: **foreground-run promotion** — a running top-level `subagent` call (single, parallel, or chain) can be moved to the background by the [pi-background-work](https://github.com/Davidcreador/pi-background-work) coordinator (`/background`), with hard process-group cancellation and group-isolated completion delivery. Without that coordinator installed, behavior is identical to upstream.
+> Most users should install [`pi-background-work`](https://github.com/Davidcreador/pi-background-work), which bundles this fork. The diff is kept minimal so upstream releases can be rebased; the integration seam is intended for upstreaming. All credit for pi-subagents itself goes to [Nico Bailon](https://github.com/nicobailon).
+
 <p>
   <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
 </p>
