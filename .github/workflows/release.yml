@@ -25,4 +25,4 @@ jobs:
       - name: Run tests
         run: npm run test:all
       - name: Publish to npm
-        run: npm publish --provenance
+        run: npm publish --provenance --tag latest
