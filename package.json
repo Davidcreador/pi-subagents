@@ -1,6 +1,6 @@
 {
   "name": "@davecodes/pi-subagents",
-  "version": "0.34.0-bg.0",
+  "version": "0.34.0-bg.1",
   "description": "Pi extension for delegating tasks to subagents with chains, parallel execution, and TUI clarification (fork with background-work foreground-run promotion)",
   "author": "Nico Bailon",
   "license": "MIT",

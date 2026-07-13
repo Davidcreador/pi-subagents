@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.34.0-bg.1] (fork)
+
+### Fixed
+- Tell the parent agent to end its turn instead of waiting or polling after a top-level subagent run is promoted.
+
 ## [0.34.0-bg.0] (fork)
 
 Fork releases of `@davecodes/pi-subagents` on top of upstream v0.34.0.
