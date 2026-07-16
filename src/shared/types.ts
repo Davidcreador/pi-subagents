@@ -462,7 +462,13 @@ export interface AcceptanceLedger {
 export interface SingleResult {
 	agent: string;
 	task: string;
+	/** Canonical session-scoped child thread target (`runId:flatIndex`). */
+	childTarget?: string;
+	/** Optional parent-session-scoped friendly child thread alias. */
+	handle?: string;
 	exitCode: number;
+	/** Absolute directory where the child process actually executed. */
+	cwd?: string;
 	detached?: boolean;
 	detachedReason?: string;
 	interrupted?: boolean;
@@ -505,6 +511,7 @@ export interface Details {
 	backgroundWork?: { jobId: string; state: "background" };
 	mode: SubagentRunMode | "management";
 	runId?: string;
+	childTargets?: Array<{ childTarget: string; handle?: string; agent?: string }>;
 	context?: "fresh" | "fork";
 	results: SingleResult[];
 	controlEvents?: ControlEvent[];
@@ -705,6 +712,7 @@ export interface AsyncStatus {
 	toolBudget?: ToolBudgetState;
 	toolBudgetBlocked?: boolean;
 	pid?: number;
+	controlToken?: string;
 	cwd?: string;
 	currentStep?: number;
 	chainStepCount?: number;
@@ -713,11 +721,14 @@ export interface AsyncStatus {
 	workflowGraph?: WorkflowGraphSnapshot;
 	steps?: Array<{
 		agent: string;
+		childTarget?: string;
+		handle?: string;
 		phase?: string;
 		label?: string;
 		outputName?: string;
 		structured?: boolean;
 		status: "pending" | "running" | "complete" | "completed" | "failed" | "paused";
+		cwd?: string;
 		children?: NestedRunSummary[];
 		sessionFile?: string;
 		transcriptPath?: string;
@@ -817,6 +828,7 @@ export interface AsyncJobState {
 export interface ForegroundResumeChild {
 	agent: string;
 	index: number;
+	cwd?: string;
 	sessionFile?: string;
 	status: SubagentResultStatus;
 	exitCode?: number;
@@ -943,6 +955,10 @@ export interface RunSyncOptions {
 	outputMode?: OutputMode;
 	maxSubagentDepth?: number;
 	nestedRoute?: NestedRouteInfo;
+	/** Optional parent-session-scoped friendly child alias. */
+	handle?: string;
+	/** Per-child filesystem inbox used for acknowledged foreground steering. */
+	steerInboxDir?: string;
 	/** Override the agent's default model (format: "provider/id" or just "id") */
 	modelOverride?: string;
 	/** Override the agent's default thinking level for this run */
@@ -1004,7 +1020,7 @@ export interface ScheduledRunsConfig {
 
 export interface ExtensionConfig {
 	asyncByDefault?: boolean;
-	/** Tool description variant registered for the parent-facing subagent tool. Defaults to full. */
+	/** Tool description variant registered for the parent-facing subagent tool. Defaults to compact. */
 	toolDescriptionMode?: ToolDescriptionMode;
 	forceTopLevelAsync?: boolean;
 	waitTool?: WaitToolConfig;

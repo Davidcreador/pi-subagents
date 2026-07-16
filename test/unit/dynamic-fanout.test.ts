@@ -131,11 +131,13 @@ describe("dynamic fanout helpers", () => {
 			expand: { from: { output: "targets", path: "/items" }, maxItems: 4 },
 			parallel: { agent: "reviewer", task: "Review {item.path}", parentSessionId: "session-parent" },
 			collect: { as: "reviews" },
+			startIndex: 3,
+			reservedItems: 4,
 		} as unknown as Parameters<typeof validateDynamicStepShape>[0];
 		assert.doesNotThrow(() => validateDynamicStepShape(runnerStep, 1, { allowRunnerFields: true }));
 		assert.throws(
 			() => validateDynamicStepShape(runnerStep, 1),
-			(error: unknown) => error instanceof DynamicFanoutError && /parentSessionId/.test(error.message),
+			(error: unknown) => error instanceof DynamicFanoutError && /(startIndex|parentSessionId)/.test(error.message),
 		);
 	});
 

@@ -50,6 +50,7 @@ import {
 	type WaitToolConfig,
 } from "../../shared/types.ts";
 import { formatDuration } from "../../shared/formatters.ts";
+import { readStatus } from "../../shared/utils.ts";
 
 /** States that mean a run is still in flight (not yet resolved). */
 const ACTIVE_STATES: ReadonlyArray<AsyncRunSummary["state"]> = ["queued", "running"];
@@ -215,6 +216,32 @@ function activeRunsForSession(params: WaitParams, deps: WaitDeps): AsyncRunSumma
 		kill: deps.kill,
 		now: deps.now,
 	});
+	const knownIds = new Set(runs.map((run) => run.id));
+	// The start event can beat the detached runner's first status.json write. Keep that
+	// launch waitable from the in-memory tracker until filesystem status catches up.
+	for (const job of deps.state.asyncJobs.values()) {
+		if (job.status !== "queued" && job.status !== "running") continue;
+		if (deps.state.currentSessionId && job.sessionId !== deps.state.currentSessionId) continue;
+		if (knownIds.has(job.asyncId)) continue;
+		const persisted = readStatus(job.asyncDir);
+		if (persisted && (persisted.runId !== job.asyncId || !ACTIVE_STATES.includes(persisted.state))) continue;
+		if (persisted && deps.state.currentSessionId && persisted.sessionId !== deps.state.currentSessionId) continue;
+		const sessionId = persisted?.sessionId ?? job.sessionId;
+		const activityState = persisted?.activityState ?? job.activityState;
+		const lastActivityAt = persisted?.lastActivityAt ?? job.lastActivityAt;
+		runs.push({
+			id: job.asyncId,
+			asyncDir: job.asyncDir,
+			...(sessionId ? { sessionId } : {}),
+			state: persisted?.state ?? job.status,
+			...(activityState ? { activityState } : {}),
+			...(lastActivityAt !== undefined ? { lastActivityAt } : {}),
+			mode: persisted?.mode ?? job.mode ?? "single",
+			startedAt: persisted?.startedAt ?? job.startedAt ?? job.updatedAt ?? (deps.now?.() ?? Date.now()),
+			lastUpdate: persisted?.lastUpdate ?? job.updatedAt,
+			steps: [],
+		});
+	}
 	return params.id ? runs.filter((run) => matchesId(run, params.id!)) : runs;
 }
 

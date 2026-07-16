@@ -73,6 +73,7 @@ import { collectDynamicResults, DynamicFanoutError, materializeDynamicParallelSt
 import { acceptanceFailureMessage, aggregateAcceptanceReport, evaluateAcceptance, resolveEffectiveAcceptance } from "../shared/acceptance.ts";
 import type { ChainOutputMap } from "../../shared/types.ts";
 import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
+import { foregroundSteerInboxDir } from "./active-child-controllers.ts";
 
 interface ChainExecutionDetailsInput {
 	results: SingleResult[];
@@ -302,6 +303,8 @@ async function runParallelChainTasks(input: ParallelChainRunInput): Promise<Sing
 				: undefined;
 			const result = await runSync(input.ctx.cwd, input.agents, task.agent, taskStr, {
 				parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
+				handle: task.handle,
+				steerInboxDir: foregroundSteerInboxDir(input.runId, input.globalTaskIndex + taskIndex),
 				cwd: taskCwd,
 				signal: input.signal,
 				interruptSignal: interruptController.signal,
@@ -440,6 +443,7 @@ interface ChainExecutionParams {
 	chainSkills?: string[];
 	chainDir?: string;
 	dynamicFanoutMaxItems?: number;
+	onDynamicChildrenMaterialized?: (tasks: Array<{ agent: string; handle?: string; cwd?: string }>, startIndex: number) => void;
 	maxSubagentDepth: number;
 	nestedRoute?: NestedRouteInfo;
 	worktreeSetupHook?: string;
@@ -841,6 +845,14 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
 			}
 
+			try {
+				params.onDynamicChildrenMaterialized?.(materialized.parallel, dynamicStartIndex);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				dynamicGroupStatuses[stepIndex] = { status: "failed", error: message };
+				return buildChainExecutionErrorResult(message, makeDetailsInput({ currentStepIndex: stepIndex, currentFlatIndex: globalTaskIndex }));
+			}
+
 			dynamicChildren[stepIndex] = materialized.items.map((item, itemIndex) => ({
 				agent: step.parallel.agent,
 				label: materialized.parallel[itemIndex]?.label,
@@ -1164,6 +1176,8 @@ export async function executeChain(params: ChainExecutionParams): Promise<ChainE
 			});
 			const r = await runSync(ctx.cwd, agents, seqStep.agent, stepTask, {
 				parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+				handle: seqStep.handle,
+				steerInboxDir: foregroundSteerInboxDir(runId, childIndex),
 				cwd: resolveChildCwd(cwd ?? ctx.cwd, seqStep.cwd),
 				signal,
 				interruptSignal: interruptController.signal,

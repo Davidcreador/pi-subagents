@@ -158,7 +158,7 @@ export default function registerSubagentNotify(
 	pi: ExtensionAPI,
 	state: Pick<SubagentState, "currentSessionId">,
 	options: RegisterSubagentNotifyOptions = {},
-): void {
+): () => void {
 	const unsubscribeStoreKey = "__pi_subagents_notify_unsubscribe__";
 	const batcherStoreKey = "__pi_subagents_notify_batcher__";
 	const globalStore = globalThis as Record<string, unknown>;
@@ -184,12 +184,13 @@ export default function registerSubagentNotify(
 	const nowFn = options.now ?? Date.now;
 	const batchConfig = resolveCompletionBatchConfig(options.batchConfig);
 	const batchers = new Map<string, CompletionBatcher<SubagentNotifyDetails>>();
-	globalStore[batcherStoreKey] = {
+	const batcherStore = {
 		dispose() {
 			for (const batcher of batchers.values()) batcher.dispose();
 			batchers.clear();
 		},
 	};
+	globalStore[batcherStoreKey] = batcherStore;
 
 	const handleComplete = (data: unknown) => {
 		const result = data as SubagentResult;
@@ -221,5 +222,15 @@ export default function registerSubagentNotify(
 		batcher.push(details);
 	};
 
-	globalStore[unsubscribeStoreKey] = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete);
+	const unsubscribe = pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete);
+	globalStore[unsubscribeStoreKey] = unsubscribe;
+	let disposed = false;
+	return () => {
+		if (disposed) return;
+		disposed = true;
+		unsubscribe();
+		batcherStore.dispose();
+		if (globalStore[unsubscribeStoreKey] === unsubscribe) delete globalStore[unsubscribeStoreKey];
+		if (globalStore[batcherStoreKey] === batcherStore) delete globalStore[batcherStoreKey];
+	};
 }

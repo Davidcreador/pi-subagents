@@ -24,7 +24,8 @@ import { cleanupAllArtifactDirs, cleanupOldArtifacts, getArtifactsDir } from "..
 import { resolveCurrentSessionId } from "../shared/session-identity.ts";
 import { cleanupOldChainDirs } from "../shared/settings.ts";
 import { clearLegacyResultAnimationTimer, renderWidget, renderSubagentResult } from "../tui/render.ts";
-import { SubagentParams, WaitParams } from "./schemas.ts";
+import { registerAgentsCommand } from "../tui/agents-overlay.ts";
+import { SendMessageParams, SubagentParams, WaitParams } from "./schemas.ts";
 import { createSubagentExecutor, type SubagentParamsLike } from "../runs/foreground/subagent-executor.ts";
 import { createAsyncJobTracker } from "../runs/background/async-job-tracker.ts";
 import { createResultWatcher } from "../runs/background/result-watcher.ts";
@@ -40,9 +41,13 @@ import { resolveWaitToolConfig, waitForSubagents } from "../runs/background/wait
 import registerSubagentNotify, { type SubagentNotifyDetails } from "../runs/background/notify.ts";
 import { SUBAGENT_CHILD_ENV, SUBAGENT_PARENT_SESSION_ENV } from "../runs/shared/pi-args.ts";
 import { formatDuration, shortenPath } from "../shared/formatters.ts";
+import { getAgentDir, readStatus } from "../shared/utils.ts";
 import { loadConfig } from "./config.ts";
 import { buildSubagentToolDescription } from "./tool-description.ts";
 import { executeDetachableSubagent } from "./background-work-adapter.ts";
+import { ChildThreadRegistry } from "../runs/shared/child-thread-registry.ts";
+import { sendMessageToChild } from "./send-message.ts";
+import { activeChildControllers } from "../runs/foreground/active-child-controllers.ts";
 import {
 	type Details,
 	type SubagentState,
@@ -295,9 +300,11 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 	);
 	startResultWatcher();
 	primeExistingResults();
+	let stopSubagentNotify = () => {};
 
 	const runtimeCleanup = () => {
 		stopResultWatcher();
+		stopSubagentNotify();
 		scheduledRunManager.stop();
 		supervisorChannel.dispose();
 		clearPendingForegroundControlNotices(state);
@@ -323,8 +330,14 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 			return executorExecute(randomUUID(), params, signal, undefined, ctx);
 		},
 	});
+	const childThreadRegistry = new ChildThreadRegistry();
+	const trustedSessionRoots = new Set<string>([
+		path.join(getAgentDir(), "sessions"),
+		...(config.defaultSessionDir ? [path.resolve(expandTilde(config.defaultSessionDir))] : []),
+	]);
 	const executor = createSubagentExecutor({
 		pi,
+		childThreadRegistry,
 		state,
 		config,
 		asyncByDefault,
@@ -333,6 +346,7 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 		getSubagentSessionRoot,
 		expandTilde,
 		discoverAgents,
+		trustedSessionRoots,
 	});
 	executorExecute = executor.execute;
 
@@ -510,6 +524,29 @@ export default function registerSubagentExtension(pi: ExtensionAPI): void {
 
 	pi.registerTool(tool);
 
+	const sendMessageTool: ToolDefinition<typeof SendMessageParams, Details> = {
+		name: "send_message",
+		label: "Send message",
+		description: "Send guidance to one exact persisted child thread. target is a canonical runId:flatIndex (works across sessions) or a friendly handle from the current parent session. Active children are steered in isolation; settled children continue their real persisted .jsonl session as a new async turn. Never starts fresh context.",
+		parameters: SendMessageParams,
+		execute(_id, params, _signal, _onUpdate, ctx) {
+			return sendMessageToChild(params, ctx, {
+				registry: childThreadRegistry,
+				state,
+				continueStoredChild: executor.continueStoredChild,
+				trustedSessionRoots: () => [...trustedSessionRoots],
+			});
+		},
+		renderCall(args, theme) {
+			return new Text(`${theme.fg("toolTitle", theme.bold("send_message "))}${theme.fg("accent", args.target)}`, 0, 0);
+		},
+		renderResult(result, _options, theme) {
+			const text = result.content.find((entry) => entry.type === "text")?.text ?? "";
+			return new Text(result.isError ? theme.fg("error", text) : text, 0, 0);
+		},
+	};
+	pi.registerTool(sendMessageTool);
+
 	const waitTool: ToolDefinition<typeof WaitParams, Details> = {
 		name: "wait",
 		label: "Wait",
@@ -531,6 +568,11 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 	pi.registerTool(waitTool);
 
 	registerSlashCommands(pi, state);
+	registerAgentsCommand(pi, {
+		registry: childThreadRegistry,
+		trustedSessionRoots: () => [...trustedSessionRoots],
+		currentSessionId: (ctx) => ctx.sessionManager.getSessionId() ?? state.currentSessionId,
+	});
 
 	const eventUnsubscribeStoreKey = "__piSubagentEventUnsubscribes";
 	const controlNoticeSeenStoreKey = "__piSubagentVisibleControlNotices";
@@ -545,7 +587,7 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 			}
 		}
 	}
-	registerSubagentNotify(pi, state, { batchConfig: config.completionBatch });
+	stopSubagentNotify = registerSubagentNotify(pi, state, { batchConfig: config.completionBatch });
 
 	const existingVisibleControlNotices = globalStore[controlNoticeSeenStoreKey];
 	const visibleControlNotices = existingVisibleControlNotices instanceof Set ? existingVisibleControlNotices as Set<string> : new Set<string>();
@@ -558,9 +600,48 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 			details: payload as SubagentControlMessageDetails,
 		});
 	};
+	const updateAsyncChildThreads = (payload: unknown) => {
+		const event = payload as { id?: string; asyncDir?: string; success?: boolean };
+		if (!event.id) return;
+		const asyncDir = event.asyncDir ?? path.join(ASYNC_DIR, event.id);
+		let status: ReturnType<typeof readStatus> = null;
+		try {
+			status = readStatus(asyncDir);
+		} catch {
+			// Malformed status remains visible through existing async diagnostics.
+		}
+		for (const record of childThreadRegistry.list().filter((candidate) => candidate.latestRunId === event.id)) {
+			const expectedTarget = `${event.id}:${record.latestIndex}`;
+			const matchedIndex = status?.steps?.findIndex((candidate) => candidate.childTarget === expectedTarget) ?? -1;
+			const fallbackStep = status?.steps?.[record.latestIndex];
+			const step = matchedIndex >= 0 ? status?.steps?.[matchedIndex] : fallbackStep?.childTarget === undefined || fallbackStep?.childTarget === expectedTarget ? fallbackStep : undefined;
+			const state = step?.status === "running" ? "running"
+				: step?.status === "pending" ? "queued"
+					: step?.status === "paused" ? "paused"
+						: step?.status === "complete" || step?.status === "completed" ? "complete"
+							: step?.status === "failed" ? "failed"
+								: event.success ? "complete" : "failed";
+			try {
+				childThreadRegistry.updateIfLatest(record.parentSessionId, record.originalTarget, {
+					latestRunId: event.id,
+					latestIndex: record.latestIndex,
+				}, {
+					state,
+					asyncDir,
+					cwd: step?.cwd ?? record.cwd,
+					sessionFile: step?.sessionFile ?? record.sessionFile,
+					transcriptPath: step?.transcriptPath ?? record.transcriptPath,
+					startedAt: step?.startedAt ?? status?.startedAt ?? record.startedAt,
+					endedAt: step?.endedAt ?? status?.endedAt,
+				});
+			} catch {
+				// Registry metadata is best effort; normal async completion delivery remains authoritative.
+			}
+		}
+	};
 	const eventUnsubscribes = [
 		pi.events.on(SUBAGENT_ASYNC_STARTED_EVENT, handleStarted),
-		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, handleComplete),
+		pi.events.on(SUBAGENT_ASYNC_COMPLETE_EVENT, (payload) => { handleComplete(payload); updateAsyncChildThreads(payload); }),
 		pi.events.on(SUBAGENT_CONTROL_EVENT, controlEventHandler),
 		rpcBridge.dispose,
 	];
@@ -632,10 +713,12 @@ wait also returns when a run needs attention (a child that went idle or blocked 
 			delete globalStore[eventUnsubscribeStoreKey];
 		}
 		stopResultWatcher();
+		stopSubagentNotify();
 		scheduledRunManager.stop();
 		if (state.poller) clearInterval(state.poller);
 		state.poller = null;
 		clearPendingForegroundControlNotices(state);
+		activeChildControllers.clear();
 		for (const timer of state.cleanupTimers.values()) {
 			clearTimeout(timer);
 		}

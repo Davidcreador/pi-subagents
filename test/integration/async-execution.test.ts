@@ -16,6 +16,8 @@ import * as path from "node:path";
 import { createEventBus, createMockPi, createTempDir, events, makeAgent, makeMinimalCtx, removeTempDir, tryImport } from "../support/helpers.ts";
 import type { MockPi } from "../support/helpers.ts";
 import { deliverInterruptRequest } from "../../src/runs/background/control-channel.ts";
+import { ChildThreadRegistry } from "../../src/runs/shared/child-thread-registry.ts";
+import { hasFreshControlHeartbeat } from "../../src/runs/shared/control-heartbeat.ts";
 
 interface AsyncExecutionResult {
 	content: Array<{ text?: string }>;
@@ -40,7 +42,7 @@ interface AsyncResultPayload {
 	wrapUpRequested?: boolean;
 	totalTokens?: { input: number; output: number; total: number };
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
-	results: Array<{ output?: string; success?: boolean; error?: string; timedOut?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
+	results: Array<{ childTarget?: string; handle?: string; output?: string; success?: boolean; error?: string; timedOut?: boolean; turnBudget?: { maxTurns: number; graceTurns: number; outcome: string; turnCount: number; wrapUpRequestedAtTurn?: number; exceededAtTurn?: number }; turnBudgetExceeded?: boolean; wrapUpRequested?: boolean; model?: string; attemptedModels?: string[]; modelAttempts?: Array<{ success?: boolean; error?: string }>; totalCost?: { inputTokens: number; outputTokens: number; costUsd: number }; structuredOutput?: unknown; intercomTarget?: string; acceptance?: { status?: string; childReport?: unknown } }>;
 	outputs?: Record<string, { text?: string; structured?: unknown }>;
 	workflowGraph?: { nodes?: Array<{ kind?: string; label?: string; phase?: string; status?: string; error?: string; outputName?: string; structured?: boolean; children?: Array<{ label?: string; outputName?: string; itemKey?: string; status?: string; error?: string }> }> };
 }
@@ -48,6 +50,8 @@ interface AsyncResultPayload {
 interface AsyncStatusPayload {
 	lifecycleArtifactVersion?: number;
 	sessionId?: string;
+	pid?: number;
+	controlToken?: string;
 	activityState?: string;
 	currentTool?: string;
 	currentPath?: string;
@@ -63,6 +67,8 @@ interface AsyncStatusPayload {
 	totalCost?: { inputTokens: number; outputTokens: number; costUsd: number };
 	parallelGroups?: Array<{ start: number; count: number; stepIndex: number }>;
 	steps?: Array<{
+		childTarget?: string;
+		handle?: string;
 		label?: string;
 		phase?: string;
 		outputName?: string;
@@ -129,7 +135,11 @@ interface TypesModule {
 
 interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
-		execute: (...args: unknown[]) => Promise<{ content: Array<{ text?: string }>; isError?: boolean; details?: { asyncId?: string } }>;
+		execute: (...args: unknown[]) => Promise<{
+			content: Array<{ text?: string }>;
+			isError?: boolean;
+			details?: { asyncId?: string; results?: Array<{ childTarget?: string; cwd?: string }> };
+		}>;
 	};
 }
 
@@ -988,6 +998,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 			else await new Promise((resolve) => setTimeout(resolve, 50));
 		}
 		assert.deepEqual(status.steps?.map((step) => step.agent), ["producer", "expand:reviewer", "consumer"]);
+		assert.equal(hasFreshControlHeartbeat(path.join(ASYNC_DIR, id), status.controlToken, status.pid), true);
 		assert.equal(status.steps?.[1]?.label, "Review {target.path}");
 		assert.equal(status.steps?.[1]?.outputName, "reviews");
 		assert.deepEqual(status.parallelGroups, [{ start: 1, count: 1, stepIndex: 1 }]);
@@ -1020,7 +1031,7 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 				collect: { as: "reviews" },
 				concurrency: 1,
 				},
-				{ agent: "consumer", task: "Use {outputs.reviews}" },
+				{ agent: "consumer", task: "Use {outputs.reviews}", handle: "consumer-thread" },
 			],
 			agents: [makeAgent("producer"), makeAgent("reviewer"), makeAgent("consumer")],
 			ctx: { pi: { events: { emit() {} } }, cwd: tempDir, currentSessionId: "session-dynamic" },
@@ -1042,6 +1053,9 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.deepEqual(collected.map((item) => item.key), ["src/a.ts", "src/b.ts"]);
 		assert.deepEqual(collected.map((item) => item.structured), [{ ok: "a" }, { ok: "b" }]);
 		assert.equal(status.steps?.length, 4);
+		assert.deepEqual(status.steps?.map((step) => step.childTarget), [`${id}:0`, `${id}:1`, `${id}:2`, `${id}:5`]);
+		assert.deepEqual(payload.results.map((child) => child.childTarget), [`${id}:0`, `${id}:1`, `${id}:2`, `${id}:5`]);
+		assert.equal(payload.results.at(-1)?.handle, "consumer-thread");
 		assert.deepEqual(status.parallelGroups, [{ start: 1, count: 2, stepIndex: 1 }]);
 		assert.equal(payload.workflowGraph?.nodes?.[1]?.kind, "dynamic-parallel-group");
 		assert.deepEqual(payload.workflowGraph?.nodes?.[1]?.children?.map((child) => child.itemKey), ["src/a.ts", "src/b.ts"]);
@@ -1231,6 +1245,45 @@ describe("async execution utilities", { skip: !available ? "pi packages not avai
 		assert.ok(Array.isArray(payload.results.at(-1)?.structuredOutput), "failed collect result should preserve ordered collection details");
 		assert.equal(payload.workflowGraph?.nodes?.[1]?.status, "failed");
 		assert.match(payload.workflowGraph?.nodes?.[1]?.error ?? "", /Collected output validation failed/);
+	});
+
+	it("foreground worktree children retain the cleaned worktree cwd in thread metadata", { skip: !createSubagentExecutor ? "executor not available" : process.platform === "win32" ? "worktree path separators unreliable on Windows CI" : undefined }, async () => {
+		const repoDir = createRepo("pi-subagent-foreground-worktree-");
+		const registryDir = createTempDir("pi-subagent-foreground-registry-");
+		try {
+			mockPi.onCall({ output: "Worktree report" });
+			const registry = new ChildThreadRegistry({ filePath: path.join(registryDir, "registry.json") });
+			const executor = createSubagentExecutor!({
+				pi: { events: createEventBus(), getSessionName: () => undefined },
+				childThreadRegistry: registry,
+				state: { baseCwd: repoDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
+				config: { defaultSessionDir: path.join(registryDir, "sessions") },
+				asyncByDefault: false,
+				tempArtifactsDir: repoDir,
+				getSubagentSessionRoot: () => repoDir,
+				expandTilde: (p: string) => p,
+				discoverAgents: () => ({ agents: [makeAgent("worker")] }),
+			});
+
+			const result = await executor.execute(
+				"foreground-worktree-cwd",
+				{ tasks: [{ agent: "worker", task: "Do worktree work" }], worktree: true, artifacts: false },
+				new AbortController().signal,
+				undefined,
+				makeMinimalCtx(repoDir),
+			);
+
+			assert.equal(result.isError, undefined, result.content.map((entry) => entry.text ?? "").join("\n"));
+			const child = result.details?.results?.[0];
+			assert.ok(child?.cwd);
+			const record = registry.list("session-123")[0];
+			assert.equal(record?.cwd, child.cwd);
+			assert.notEqual(record?.cwd, repoDir);
+			assert.equal(fs.existsSync(record!.cwd), false);
+		} finally {
+			removeTempDir(registryDir);
+			removeTempDir(repoDir);
+		}
 	});
 
 	it("top-level async worktree parallel resolves reads against the worktree and output under project artifacts", { skip: !isAsyncAvailable() || !createSubagentExecutor ? "jiti or executor not available" : process.platform === "win32" ? "worktree path separators unreliable on Windows CI" : undefined }, async () => {

@@ -1,7 +1,7 @@
 > [!NOTE]
 > **Fork** of [nicobailon/pi-subagents](https://github.com/nicobailon/pi-subagents) (base: v0.34.0), published as `@davecodes/pi-subagents`.
-> It adds exactly one capability: **foreground-run promotion** — a running top-level `subagent` call (single, parallel, or chain) can be moved to the background by the [pi-background-work](https://github.com/Davidcreador/pi-background-work) coordinator (`/background`), with hard process-group cancellation and group-isolated completion delivery. Without that coordinator installed, behavior is identical to upstream.
-> Most users should install [`pi-background-work`](https://github.com/Davidcreador/pi-background-work), which bundles this fork. The diff is kept minimal so upstream releases can be rebased; the integration seam is intended for upstreaming. All credit for pi-subagents itself goes to [Nico Bailon](https://github.com/nicobailon).
+> This fork adds foreground-run promotion through [pi-background-work](https://github.com/Davidcreador/pi-background-work), stable child threads and messaging, and a live `/agents` browser. All credit for pi-subagents itself goes to [Nico Bailon](https://github.com/nicobailon).
+> Most users should install [`pi-background-work`](https://github.com/Davidcreador/pi-background-work), which bundles this fork.
 
 <p>
   <img src="https://raw.githubusercontent.com/nicobailon/pi-subagents/main/banner.png" alt="pi-subagents" width="1100">
@@ -9,17 +9,17 @@
 
 # pi-subagents
 
-`pi-subagents` lets Pi delegate work to focused child agents. Use it for code review, scouting, implementation, parallel audits, saved workflows, background jobs, and anything else that benefits from a second or third set of model eyes.
+`pi-subagents` gives Pi focused child sessions for independent investigation, specialist judgment, implementation, and review. Pi may choose this tool for a non-trivial request even when you do not mention subagents; trivial work stays in the parent session.
 
 https://github.com/user-attachments/assets/702554ec-faaf-4635-80aa-fb5d6e292fd1
 
 ## Installation
 
 ```bash
-pi install npm:pi-subagents
+pi install npm:@davecodes/pi-subagents
 ```
 
-That is the only required step. You can add optional pieces later.
+Requires Node `>=22.19.0` and Pi `>=0.80.7`. You can add optional configuration later.
 
 ## Try this first
 
@@ -45,11 +45,11 @@ That is enough to start.
 
 ## What happens
 
-Pi is the parent session. A subagent is a focused child Pi session with its own job.
+Pi is the parent session. A subagent is a focused child Pi session with its own bounded job.
 
-When you ask for a subagent, Pi starts the child, gives it the task, and brings the result back. Foreground runs stream in the conversation. Background runs keep working and can be checked later.
+For a non-trivial request, Pi decides whether a focused child would materially improve correctness, coverage, or confidence. If so, it can start one without special user syntax, give it the task, and bring the result back. Foreground runs stream in the conversation. Background runs keep working and can be checked later.
 
-Installing the extension does not start an automatic reviewer in the background. It gives Pi a delegation tool. If you want every implementation reviewed, say that in your prompt or put it in your project instructions:
+Installing the extension does not launch jobs by itself or force delegation on every request. It gives Pi a model-facing tool for selective, proactive delegation. Trivial or mechanical work stays in the parent session. If you want every implementation reviewed, say that in your prompt or put it in your project instructions:
 
 ```text
 When you finish implementing, run a reviewer subagent before summarizing.
@@ -100,7 +100,7 @@ Those are ordinary Pi requests. Pi decides whether to call `subagent`, which age
 | Run in the background | “Run this in the background.” |
 | Browse agents | “Show me the available subagents.” |
 | Use a saved workflow | “Run the review chain on this branch.” |
-| See running work | “Show active async runs.” or “Show the subagent fleet.” |
+| See running work | “Open the agent browser.” or “Show the subagent fleet.” |
 | Check setup | “Check whether subagents are configured correctly.” |
 
 The extension ships with builtin agents you can use immediately.
@@ -194,7 +194,27 @@ To keep subagents inside a budget or compliance profile, enforce a model scope. 
 
 Foreground runs stream progress in the conversation while they run.
 
+Use `/agents` for an interactive child browser. It starts with threads owned by the current parent session; press `Tab` to toggle read-only history across sessions, `Enter` to open the selected transcript, arrows or `j`/`k` to navigate, and `Esc` to back out or close. The selected Pi session and tool activity refresh live. The registry stores only routing metadata; transcript content remains in the child session file.
+
 Background runs keep working after control returns to you. Inspect active runs with `subagent({ action: "status" })`, or a specific run with `subagent({ action: "status", id: "..." })`. For a read-only fleet view across active foreground and background work, use `/subagents-fleet` or `subagent({ action: "status", view: "fleet" })`. To inspect what a background child is saying without hunting through artifact directories, tail its live transcript with `subagent({ action: "status", id: "...", view: "transcript" })`; add `index` for a specific child in a parallel or chain run.
+
+### Stable child threads and messaging
+
+Every newly launched child receives a canonical target, `<runId>:<flatIndex>`, shown in results, status, and `/agents`. Canonical targets remain stable across continuation turns and can be addressed from another parent session. Add an optional `handle` when launching a single child, parallel task, or chain step for a friendlier current-session alias; counted children receive `-1`, `-2`, and so on.
+
+```typescript
+subagent({ agent: "worker", handle: "builder", task: "Implement the approved plan" })
+subagent({ tasks: [{ agent: "reviewer", handle: "audit", task: "Review the diff" }] })
+```
+
+Use the narrow `send_message` tool to guide one thread:
+
+```typescript
+send_message({ target: "audit", message: "Check the timeout path too." })
+send_message({ target: "550e8400-e29b-41d4-a716-446655440000:0", message: "Continue with the failing test." })
+```
+
+An active target receives an isolated steering request. A settled target continues the exact persisted child session as a new async turn, preserving its cwd and stable thread identity. If the session cannot be validated, `send_message` fails instead of starting fresh context. Friendly handles resolve only inside the current parent session; canonical targets are the cross-session address.
 
 They also show a compact async widget and send completion notifications. Parallel background runs show per-agent progress instead of fake chain steps. Chains with parallel groups keep their grouped shape in progress and results, so failed or paused agents stay visible next to completed ones. When a child is explicitly allowed to fan out with `tools: subagent`, its nested runs appear under that parent child in the main status tree instead of being hidden inside the child process.
 
@@ -1147,7 +1167,7 @@ After a worktree parallel step completes, per-agent diff stats are appended to t
 { "toolDescriptionMode": "compact" }
 ```
 
-Controls the parent-facing `subagent` tool description registered at startup. `full` is the default. `compact` keeps the execution modes, async/wait guidance, child-safety boundary, management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat.
+Controls the parent-facing `subagent` tool description registered at startup. `compact` is the default and keeps selective proactive-delegation guidance, execution modes, async/wait guidance, child-safety boundaries, the management/action split, one-writer review guidance, and artifact/status essentials with less prompt bloat. Set `full` explicitly for the expanded reference.
 
 `custom` reads `subagent-tool-description.md` from the project config directory, then from `~/.pi/agent/subagent-tool-description.md`. Missing, empty, unreadable, or oversized custom files fall back to the full description. Custom templates may use `{{fullDescription}}`, `{{compactDescription}}`, `{{safetyGuidance}}`, `{{agentDir}}`, and `{{projectConfigDir}}`; the safety guidance is always present so custom prose cannot remove the runtime guardrails. Restart Pi after changing the mode or custom file.
 
@@ -1474,6 +1494,8 @@ The main runtime files are:
 | `src/runs/background/subagent-runner.ts` | Detached async runner. |
 | `src/runs/background/async-execution.ts` | Background launch support. |
 | `src/runs/background/async-status.ts` | Status discovery and formatting for async runs. |
+| `src/runs/shared/child-thread-registry.ts` / `src/extension/send-message.ts` | Stable child identity, metadata persistence, exact steering, and validated continuation. |
+| `src/tui/agents-overlay.ts` | `/agents` thread browser and live Pi session/tool rendering. |
 | `src/runs/foreground/chain-execution.ts` / `src/agents/chain-serializer.ts` | Chain orchestration and `.chain.md` parsing. |
 | `src/shared/settings.ts` | Chain behavior, instructions, and config helpers. |
 | `src/runs/shared/worktree.ts` | Git worktree isolation. |

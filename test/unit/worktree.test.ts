@@ -23,6 +23,10 @@ function git(cwd: string, args: string[]): string {
 	return result.stdout.trim();
 }
 
+function fixtureRunId(label: string): string {
+	return `${label}-${process.pid}`;
+}
+
 function createRepo(prefix: string): string {
 	const repoDir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 	git(repoDir, ["init"]);
@@ -56,12 +60,13 @@ describe("worktree", () => {
 		const repoDir = createRepo("pi-worktree-structure-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "structure", 2);
+			const runId = fixtureRunId("structure");
+			setup = createWorktrees(repoDir, runId, 2);
 			assert.equal(setup.worktrees.length, 2);
 			assert.equal(setup.cwd, git(repoDir, ["rev-parse", "--show-toplevel"]));
 			for (let i = 0; i < setup.worktrees.length; i++) {
 				const worktree = setup.worktrees[i]!;
-				assert.equal(worktree.branch, `pi-parallel-structure-${i}`);
+				assert.equal(worktree.branch, `pi-parallel-${runId}-${i}`);
 				assert.equal(worktree.index, i);
 				assert.equal(worktree.agentCwd, worktree.path);
 				assert.equal(worktree.nodeModulesLinked, false);
@@ -84,7 +89,7 @@ describe("worktree", () => {
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(nestedDir, "subdir", 1);
+			setup = createWorktrees(nestedDir, fixtureRunId("subdir"), 1);
 			assert.equal(setup.worktrees[0]!.agentCwd, path.join(setup.worktrees[0]!.path, "packages", "app"));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
@@ -101,9 +106,10 @@ describe("worktree", () => {
 		git(repoDir, ["commit", "-m", "add nested dir"]);
 
 		try {
+			const runId = fixtureRunId("preview");
 			assert.equal(
-				resolveExpectedWorktreeAgentCwd(nestedDir, "preview", 2),
-				path.join(os.tmpdir(), "pi-worktree-preview-2", "packages", "app"),
+				resolveExpectedWorktreeAgentCwd(nestedDir, runId, 2),
+				path.join(os.tmpdir(), `pi-worktree-${runId}-2`, "packages", "app"),
 			);
 		} finally {
 			cleanupRepo(repoDir);
@@ -112,11 +118,12 @@ describe("worktree", () => {
 
 	it("creates worktrees under a configured base directory", () => {
 		const repoDir = createRepo("pi-worktree-base-dir-");
-		const baseDir = path.join(os.tmpdir(), `pi-worktree-base-${Date.now().toString(36)}`, "nested");
+		const baseDir = path.join(os.tmpdir(), `pi-worktree-base-${process.pid}-${Date.now().toString(36)}`, "nested");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "base-dir", 1, { baseDir });
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-base-dir-0"));
+			const runId = fixtureRunId("base-dir");
+			setup = createWorktrees(repoDir, runId, 1, { baseDir });
+			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, `pi-worktree-${runId}-0`));
 			assert.ok(fs.existsSync(baseDir), "configured base directory should be created");
 		} finally {
 			if (setup) cleanupWorktrees(setup);
@@ -128,12 +135,13 @@ describe("worktree", () => {
 	it("uses PI_SUBAGENTS_WORKTREE_DIR when no base directory is configured", () => {
 		const repoDir = createRepo("pi-worktree-env-base-dir-");
 		const previous = process.env.PI_SUBAGENTS_WORKTREE_DIR;
-		const baseDir = path.join(os.tmpdir(), `pi-worktree-env-base-${Date.now().toString(36)}`);
+		const baseDir = path.join(os.tmpdir(), `pi-worktree-env-base-${process.pid}-${Date.now().toString(36)}`);
 		let setup: WorktreeSetup | undefined;
 		try {
 			process.env.PI_SUBAGENTS_WORKTREE_DIR = baseDir;
-			setup = createWorktrees(repoDir, "env-base-dir", 1);
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-env-base-dir-0"));
+			const runId = fixtureRunId("env-base-dir");
+			setup = createWorktrees(repoDir, runId, 1);
+			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, `pi-worktree-${runId}-0`));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
 			if (previous === undefined) {
@@ -151,7 +159,7 @@ describe("worktree", () => {
 		try {
 			fs.writeFileSync(path.join(repoDir, "tracked.txt"), "dirty\n", "utf-8");
 			assert.throws(
-				() => createWorktrees(repoDir, "dirty", 1),
+				() => createWorktrees(repoDir, fixtureRunId("dirty"), 1),
 				/worktree isolation requires a clean git working tree/i,
 			);
 		} finally {
@@ -208,7 +216,7 @@ describe("worktree", () => {
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "diff", 1);
+			setup = createWorktrees(repoDir, fixtureRunId("diff"), 1);
 			const worktree = setup.worktrees[0]!;
 			fs.writeFileSync(path.join(worktree.path, "committed.ts"), "export const committed = true;\n", "utf-8");
 			git(worktree.path, ["add", "committed.ts"]);
@@ -243,7 +251,7 @@ describe("worktree", () => {
 		const repoDir = createRepo("pi-worktree-cleanup-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "cleanup", 2);
+			setup = createWorktrees(repoDir, fixtureRunId("cleanup"), 2);
 			const worktreePaths = setup.worktrees.map((worktree) => worktree.path);
 			const branches = setup.worktrees.map((worktree) => worktree.branch);
 			cleanupWorktrees(setup);
@@ -272,7 +280,7 @@ describe("worktree", () => {
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "node-modules", 1);
+			setup = createWorktrees(repoDir, fixtureRunId("node-modules"), 1);
 			const symlinkPath = path.join(setup.worktrees[0]!.path, "node_modules");
 			assert.equal(setup.worktrees[0]!.nodeModulesLinked, true);
 			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, ["node_modules"]);
@@ -298,7 +306,7 @@ describe("worktree", () => {
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "tracked-node-modules", 1);
+			setup = createWorktrees(repoDir, fixtureRunId("tracked-node-modules"), 1);
 			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
 			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
 			fs.writeFileSync(path.join(setup.worktrees[0]!.path, "tracked.txt"), "modified\n", "utf-8");
@@ -327,7 +335,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".venv"] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "hook-relative", 1, {
+			setup = createWorktrees(repoDir, fixtureRunId("hook-relative"), 1, {
 				setupHook: { hookPath: path.relative(repoDir, hookPath) },
 			});
 			assert.ok(setup.worktrees[0]!.syntheticPaths.includes(".venv"));
@@ -347,7 +355,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "hook-absolute", 1, {
+			setup = createWorktrees(repoDir, fixtureRunId("hook-absolute"), 1, {
 				setupHook: { hookPath },
 			});
 			assert.equal(setup.worktrees.length, 1);
@@ -361,7 +369,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 		const repoDir = createRepo("pi-worktree-hook-bare-");
 		try {
 			assert.throws(
-				() => createWorktrees(repoDir, "hook-bare", 1, { setupHook: { hookPath: "node" } }),
+				() => createWorktrees(repoDir, fixtureRunId("hook-bare"), 1, { setupHook: { hookPath: "node" } }),
 				/worktree setup hook must be an absolute path or a repo-relative path/i,
 			);
 		} finally {
@@ -376,7 +384,7 @@ import * as fs from "node:fs";
 JSON.parse(fs.readFileSync(0, "utf-8"));
 process.stdout.write(JSON.stringify({ syntheticPaths: ["tracked.txt"] }));
 `);
-		const runId = `hook-tracked-${Date.now().toString(36)}`;
+		const runId = fixtureRunId("hook-tracked");
 		try {
 			assert.throws(
 				() => createWorktrees(repoDir, runId, 1, { setupHook: { hookPath: path.relative(repoDir, hookPath) } }),
@@ -394,7 +402,7 @@ import * as fs from "node:fs";
 const payload = JSON.parse(fs.readFileSync(0, "utf-8"));
 process.stdout.write(JSON.stringify({ syntheticPaths: [payload.worktreePath + "/.venv"] }));
 `);
-		const runId = `hook-absolute-synthetic-${Date.now().toString(36)}`;
+		const runId = fixtureRunId("hook-absolute-synthetic");
 		try {
 			assert.throws(
 				() => createWorktrees(repoDir, runId, 1, { setupHook: { hookPath: path.relative(repoDir, hookPath) } }),
@@ -417,7 +425,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".env.local"] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "hook-diff", 1, {
+			setup = createWorktrees(repoDir, fixtureRunId("hook-diff"), 1, {
 				setupHook: { hookPath: path.relative(repoDir, hookPath) },
 			});
 			fs.writeFileSync(path.join(setup.worktrees[0]!.path, "tracked.txt"), "modified-by-agent\n", "utf-8");
@@ -433,7 +441,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".env.local"] }));
 
 	it("cleans up created worktrees when a later hook setup fails", { skip: hookScriptSkip }, () => {
 		const repoDir = createRepo("pi-worktree-hook-cleanup-");
-		const runId = `hook-cleanup-${Date.now().toString(36)}`;
+		const runId = fixtureRunId("hook-cleanup");
 		const hookPath = createHookScript(repoDir, "flaky-hook.mjs", `
 import * as fs from "node:fs";
 const payload = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -464,7 +472,7 @@ setTimeout(() => {
 	process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 }, 1000);
 `);
-		const runId = `hook-timeout-${Date.now().toString(36)}`;
+		const runId = fixtureRunId("hook-timeout");
 		try {
 			assert.throws(
 				() => createWorktrees(repoDir, runId, 1, {

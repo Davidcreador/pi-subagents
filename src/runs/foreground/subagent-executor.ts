@@ -46,6 +46,9 @@ import { validateToolBudgetConfig } from "../shared/tool-budget.ts";
 import { finalizeSingleOutput, injectSingleOutputInstruction, normalizeSingleOutputOverride, resolveSingleOutputPath, validateFileOnlyOutputMode } from "../shared/single-output.ts";
 import { compactForegroundDetails, getSingleResultOutput, mapConcurrent, readStatus, resolveChildCwd, sumResultsCost, sumResultsUsage } from "../../shared/utils.ts";
 import { DEFAULT_GLOBAL_CONCURRENCY_LIMIT, Semaphore } from "../shared/parallel-utils.ts";
+import { childTarget, collectStaticChildIdentities, expandCountHandle, type ChildIdentity } from "../shared/child-identity.ts";
+import { ChildThreadRegistry, type ChildThreadState } from "../shared/child-thread-registry.ts";
+import { foregroundSteerInboxDir } from "./active-child-controllers.ts";
 import {
 	attachNestedChildrenToResultChildren,
 	buildSubagentResultIntercomPayload,
@@ -114,6 +117,7 @@ const MUTATING_MANAGEMENT_ACTIONS = new Set(["create", "update", "delete", "ejec
 interface TaskParam {
 	agent: string;
 	task: string;
+	handle?: string;
 	cwd?: string;
 	count?: number;
 	output?: string | boolean;
@@ -127,6 +131,7 @@ interface TaskParam {
 }
 
 export interface SubagentParamsLike {
+	handle?: string;
 	action?: string;
 	id?: string;
 	runId?: string;
@@ -168,6 +173,7 @@ export interface SubagentParamsLike {
 
 interface ExecutorDeps {
 	pi: ExtensionAPI;
+	childThreadRegistry?: ChildThreadRegistry;
 	state: SubagentState;
 	config: ExtensionConfig;
 	asyncByDefault: boolean;
@@ -176,6 +182,7 @@ interface ExecutorDeps {
 	getSubagentSessionRoot: (parentSessionFile: string | null) => string;
 	expandTilde: (p: string) => string;
 	discoverAgents: (cwd: string, scope: AgentScope) => { agents: AgentConfig[]; modelScope?: ModelScopeConfig };
+	trustedSessionRoots?: Set<string>;
 	allowMutatingManagementActions?: boolean;
 	kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 }
@@ -188,6 +195,7 @@ interface ExecutionContextData {
 	onUpdate?: (r: AgentToolResult<Details>) => void;
 	agents: AgentConfig[];
 	runId: string;
+	asyncRunId?: string;
 	shareEnabled: boolean;
 	sessionRoot: string;
 	sessionDirForIndex: (idx?: number) => string;
@@ -321,7 +329,7 @@ function trimRememberedForegroundRuns(state: SubagentState): void {
 	}
 }
 
-function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; results: SingleResult[] }): void {
+function rememberForegroundRun(state: SubagentState, input: { runId: string; mode: "single" | "parallel" | "chain"; cwd: string; childCwds?: string[]; results: SingleResult[] }): void {
 	state.foregroundRuns ??= new Map();
 	const previous = state.foregroundRuns.get(input.runId);
 	const updatedAt = Date.now();
@@ -334,6 +342,7 @@ function rememberForegroundRun(state: SubagentState, input: { runId: string; mod
 			const child = {
 				agent: result.agent,
 				index,
+				cwd: input.childCwds?.[index] ?? previous?.children[index]?.cwd ?? input.cwd,
 				status: resolveSubagentResultStatus({ exitCode: result.exitCode, interrupted: result.interrupted, detached: result.detached }),
 				updatedAt,
 				...(result.exitCode !== undefined ? { exitCode: result.exitCode } : {}),
@@ -365,6 +374,7 @@ function updateRememberedForegroundChild(state: SubagentState, input: { runId: s
 		...child,
 		agent: input.result.agent,
 		index: input.index,
+		cwd: input.cwd,
 		status: resolveSubagentResultStatus({ exitCode: input.result.exitCode, interrupted: input.result.interrupted, detached: false }),
 		updatedAt,
 		...(input.result.exitCode !== undefined ? { exitCode: input.result.exitCode } : {}),
@@ -396,7 +406,9 @@ function resolveForegroundResumeTarget(params: SubagentParamsLike, state: Subage
 	if (path.extname(child.sessionFile) !== ".jsonl") throw new Error(`Foreground run '${run.runId}' child ${index} session file must be a .jsonl file: ${child.sessionFile}`);
 	const sessionFile = path.resolve(child.sessionFile);
 	if (!fs.existsSync(sessionFile)) throw new Error(`Foreground run '${run.runId}' child ${index} session file does not exist: ${child.sessionFile}`);
-	return { runId: run.runId, mode: run.mode, state: "complete", agent: child.agent, index, intercomTarget: resolveSubagentIntercomTarget(run.runId, child.agent, index), cwd: run.cwd, sessionFile };
+	const childCwd = child.cwd ?? run.cwd;
+	if (!fs.existsSync(childCwd) || !fs.statSync(childCwd).isDirectory()) throw new Error(`Foreground run '${run.runId}' child ${index} cwd no longer exists: ${childCwd}`);
+	return { runId: run.runId, mode: run.mode, state: "complete", agent: child.agent, index, intercomTarget: resolveSubagentIntercomTarget(run.runId, child.agent, index), cwd: childCwd, sessionFile };
 }
 
 type AsyncResumeSourceTarget = ReturnType<typeof resolveAsyncResumeTarget> & { source: "async" };
@@ -539,15 +551,15 @@ function interruptAsyncRun(
 	const target = getAsyncInterruptTarget(state, runId, location);
 	if (!target) return null;
 	const status = reconcileAsyncRun(target.asyncDir, { kill }).status;
-	if (!status || status.state !== "running" || typeof status.pid !== "number") {
+	if (!status || status.state !== "running") {
 		return {
-			content: [{ type: "text", text: `No running async run with an interrupt-capable pid was found for '${runId ?? "current"}'.` }],
+			content: [{ type: "text", text: `No running async run was found for '${runId ?? "current"}'.` }],
 			isError: true,
 			details: { mode: "management", results: [] },
 		};
 	}
 	try {
-		deliverInterruptRequest({ asyncDir: target.asyncDir, pid: status.pid, kill, source: "interrupt-action" });
+		deliverInterruptRequest({ asyncDir: target.asyncDir, source: "interrupt-action" });
 		const tracked = state.asyncJobs.get(target.asyncId);
 		if (tracked) {
 			tracked.activityState = undefined;
@@ -902,10 +914,9 @@ function directNestedAsyncInterrupt(target: ResolvedSubagentRunId & { kind: "nes
 	const asyncDir = resolveNestedAsyncDir(target.match.rootRunId, run);
 	if (!asyncDir) return undefined;
 	const status = reconcileAsyncRun(asyncDir, { resultsDir: path.join(RESULTS_DIR, "nested", target.match.rootRunId) }).status;
-	const pid = typeof status?.pid === "number" && status.pid > 0 ? status.pid : run.pid;
-	if (!status || status.state !== "running" || typeof pid !== "number" || pid <= 0) return undefined;
+	if (!status || status.state !== "running") return undefined;
 	try {
-		deliverInterruptRequest({ asyncDir, pid, source: "nested-interrupt" });
+		deliverInterruptRequest({ asyncDir, source: "nested-interrupt" });
 		return { content: [{ type: "text", text: `Interrupt requested for nested async run ${run.id}.` }], details: { mode: "management", results: [] } };
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -961,6 +972,8 @@ async function resumeAsyncRun(input: {
 	requestCwd: string;
 	ctx: ExtensionContext;
 	deps: ExecutorDeps;
+	target?: ResumeSourceTarget;
+	plannedRunId?: string;
 }): Promise<AgentToolResult<Details>> {
 	const followUp = (input.params.message ?? input.params.task ?? "").trim();
 	const attachChain = (input.params.chain?.length ?? 0) > 0 ? input.params.chain as ChainStep[] : undefined;
@@ -975,6 +988,9 @@ async function resumeAsyncRun(input: {
 	let target: ResumeSourceTarget;
 	const parentSessionFile = input.ctx.sessionManager.getSessionFile() ?? null;
 	try {
+		if (input.target) {
+			target = input.target;
+		} else {
 		const requestedId = input.params.id ?? input.params.runId;
 		let resolved: ResolvedSubagentRunId | undefined;
 		try {
@@ -1002,6 +1018,7 @@ async function resumeAsyncRun(input: {
 			target = resolveNestedResumeTarget(resolved, trustedSessionRoots);
 		} else {
 			target = resolveResumeTarget(input.params, input.deps.state, { asyncRequireSessionFile: !attachChain });
+		}
 		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
@@ -1147,7 +1164,7 @@ async function resumeAsyncRun(input: {
 		return { content: [{ type: "text", text: formatAsyncStartedMessage(lines.join("\n")) }], details: result.details };
 	}
 
-	const runId = randomUUID().slice(0, 8);
+	const runId = input.plannedRunId ?? randomUUID().slice(0, 8);
 	const artifactConfig: ArtifactConfig = { ...DEFAULT_ARTIFACT_CONFIG, enabled: input.params.artifacts !== false };
 	const artifactsDir = getArtifactsDir(parentSessionFile, effectiveCwd);
 	const availableModels = input.ctx.modelRegistry.getAvailable().map(toModelInfo);
@@ -1543,8 +1560,9 @@ function expandTopLevelTaskCounts(tasks: TaskParam[]): { tasks?: TaskParam[]; er
 			return { error: `tasks[${taskIndex}].count must be an integer >= 1` };
 		}
 		const { count, ...concreteTask } = task;
-		for (let repeat = 0; repeat < (rawCount ?? 1); repeat++) {
-			expanded.push({ ...concreteTask });
+		const effectiveCount = rawCount ?? 1;
+		for (let repeat = 0; repeat < effectiveCount; repeat++) {
+			expanded.push({ ...concreteTask, ...(expandCountHandle(task.handle, effectiveCount, repeat) ? { handle: expandCountHandle(task.handle, effectiveCount, repeat) } : {}) });
 		}
 	}
 	return { tasks: expanded };
@@ -1566,8 +1584,10 @@ function expandChainParallelCounts(chain: ChainStep[]): { chain?: ChainStep[]; e
 				return { error: `chain[${stepIndex}].parallel[${taskIndex}].count must be an integer >= 1` };
 			}
 			const { count, ...concreteTask } = task;
-			for (let repeat = 0; repeat < (rawCount ?? 1); repeat++) {
-				expandedParallel.push({ ...concreteTask });
+			const effectiveCount = rawCount ?? 1;
+			for (let repeat = 0; repeat < effectiveCount; repeat++) {
+				const handle = expandCountHandle(task.handle, effectiveCount, repeat);
+				expandedParallel.push({ ...concreteTask, ...(handle ? { handle } : {}) });
 			}
 		}
 		expandedChain.push({ ...step, parallel: expandedParallel });
@@ -1805,7 +1825,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 			details: { mode: "single" as const, results: [] },
 		};
 	}
-	const id = randomUUID();
+	const id = data.asyncRunId ?? randomUUID();
 	const asyncCtx = {
 		pi: deps.pi,
 		cwd: ctx.cwd,
@@ -1829,6 +1849,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const skillOverrides = params.tasks.map((task) => normalizeSkillInput(task.skill));
 		const parallelTasks = params.tasks.map((task, index) => ({
 			agent: task.agent,
+			...(task.handle ? { handle: task.handle } : {}),
 			task: shouldForkAgent(contextPolicy, task.agent) ? wrapForkTask(task.task) : task.task,
 			cwd: task.cwd,
 			...(modelOverrides[index] ? { model: modelOverrides[index] } : {}),
@@ -1929,6 +1950,7 @@ function runAsyncPath(data: ExecutionContextData, deps: ExecutorDeps): AgentTool
 		const modelOverride = resolveSubagentModelOverride((params.model as string | undefined) ?? a.model, ctx.model, availableModels, currentProvider, { scope: data.modelScope, source: (params.model as string | undefined) ? "explicit" : "inherited" });
 		return executeAsyncSingle(id, {
 			agent: params.agent!,
+			handle: params.handle,
 			task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(params.task ?? "") : (params.task ?? ""),
 			agentConfig: a,
 			ctx: asyncCtx,
@@ -2021,6 +2043,22 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		chainSkills,
 		chainDir: params.chainDir ?? getProjectChainRunsDir(effectiveCwd),
 		dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
+		onDynamicChildrenMaterialized: (tasks, startIndex) => {
+			const parentSessionId = ctx.sessionManager.getSessionId() ?? deps.state.currentSessionId;
+			if (!parentSessionId) throw new Error("Cannot register dynamic child handles without a parent session id.");
+			deps.childThreadRegistry!.registerMany(tasks.map((task, index) => ({
+				originalTarget: childTarget(runId, startIndex + index),
+				handle: task.handle,
+				parentSessionId,
+				runId,
+				index: startIndex + index,
+				state: "queued" as const,
+				cwd: resolveChildCwd(effectiveCwd, task.cwd),
+				agent: task.agent,
+				sessionFile: sessionFileForTask(task.agent, startIndex + index),
+				trustedSessionRoot: data.sessionRoot,
+			})));
+		},
 		maxSubagentDepth: currentMaxSubagentDepth,
 		worktreeSetupHook: deps.config.worktreeSetupHook,
 		worktreeSetupHookTimeoutMs: deps.config.worktreeSetupHookTimeoutMs,
@@ -2042,7 +2080,7 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 				details: { mode: "chain" as const, results: [] },
 			};
 		}
-		const id = randomUUID();
+		const id = data.asyncRunId ?? runId;
 		const asyncCtx = {
 			pi: deps.pi,
 			cwd: ctx.cwd,
@@ -2092,7 +2130,15 @@ async function runChainPath(data: ExecutionContextData, deps: ExecutorDeps): Pro
 		rawChainDetails.totalCost = sumResultsCost(rawChainDetails.results);
 	}
 	const chainDetails = rawChainDetails ? compactForegroundDetails(rawChainDetails) : undefined;
-	if (chainDetails) rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, results: chainDetails.results });
+	if (chainDetails) {
+		const parentSessionId = ctx.sessionManager.getSessionId() ?? deps.state.currentSessionId ?? "";
+		const childCwds = chainDetails.results.map((result, index) => {
+			if (result.cwd) return result.cwd;
+			try { return deps.childThreadRegistry!.resolve(result.childTarget ?? childTarget(runId, index), parentSessionId).cwd; }
+			catch { return effectiveCwd; }
+		});
+		rememberForegroundRun(deps.state, { runId, mode: "chain", cwd: effectiveCwd, childCwds, results: chainDetails.results });
+	}
 	const intercomReceipt = chainDetails && !chainDetails.results.some((result) => result.interrupted || result.detached)
 		? await maybeBuildForegroundIntercomReceipt({
 			pi: deps.pi,
@@ -2304,6 +2350,8 @@ async function runForegroundParallelTasks(input: ForegroundParallelRunInput): Pr
 		const agentConfig = input.agents.find((agent) => agent.name === task.agent);
 		return runSync(input.ctx.cwd, input.agents, task.agent, taskText, {
 			parentSessionId: input.ctx.sessionManager.getSessionId() ?? undefined,
+			handle: task.handle,
+			steerInboxDir: foregroundSteerInboxDir(input.runId, index),
 			cwd: taskCwd,
 			signal: input.signal,
 			interruptSignal: interruptController.signal,
@@ -2516,7 +2564,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 					details: { mode: "parallel" as const, results: [] },
 				};
 			}
-			const id = randomUUID();
+			const id = data.asyncRunId ?? runId;
 			const asyncCtx = {
 				pi: deps.pi,
 				cwd: ctx.cwd,
@@ -2531,6 +2579,7 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 				const progress = taskDisallowsFileUpdates(taskText) ? false : behaviorOverrides[i]?.progress;
 				return {
 					agent: t.agent,
+					...(t.handle ? { handle: t.handle } : {}),
 					task: taskText,
 					cwd: t.cwd,
 					...(modelOverrides[i] ? { model: modelOverrides[i] } : {}),
@@ -2681,7 +2730,13 @@ async function runParallelPath(data: ExecutionContextData, deps: ExecutorDeps): 
 			totalChildUsage: sumResultsUsage(results),
 			totalCost: sumResultsCost(results),
 		});
-		rememberForegroundRun(deps.state, { runId, mode: "parallel", cwd: effectiveCwd, results: details.results });
+		rememberForegroundRun(deps.state, {
+			runId,
+			mode: "parallel",
+			cwd: effectiveCwd,
+			childCwds: tasks.map((task, index) => resolveParallelTaskCwd(task, effectiveCwd, worktreeSetup, index)),
+			results: details.results,
+		});
 		if (interrupted) {
 			return {
 				content: [{ type: "text", text: `Parallel run paused after interrupt (${interrupted.agent}). Waiting for explicit next action.` }],
@@ -2832,7 +2887,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 					details: { mode: "single" as const, results: [] },
 				};
 			}
-			const id = randomUUID();
+			const id = data.asyncRunId ?? runId;
 			const asyncCtx = {
 				pi: deps.pi,
 				cwd: ctx.cwd,
@@ -2844,6 +2899,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 			};
 			return executeAsyncSingle(id, {
 				agent: params.agent!,
+				handle: params.handle,
 				task: shouldForkAgent(contextPolicy, params.agent!) ? wrapForkTask(task) : task,
 				agentConfig,
 				ctx: asyncCtx,
@@ -2931,6 +2987,8 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 	const deadlineAt = data.deadlineAt ?? (data.timeoutMs !== undefined ? Date.now() + data.timeoutMs : undefined);
 	const r = await runSync(ctx.cwd, agents, params.agent!, task, {
 		parentSessionId: ctx.sessionManager.getSessionId() ?? undefined,
+		handle: params.handle,
+		steerInboxDir: foregroundSteerInboxDir(runId, 0),
 		cwd: effectiveCwd,
 		signal,
 		interruptSignal: interruptController.signal,
@@ -3011,7 +3069,7 @@ async function runSinglePath(data: ExecutionContextData, deps: ExecutorDeps): Pr
 		totalChildUsage: sumResultsUsage([r]),
 		totalCost: sumResultsCost([r]),
 	});
-	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, results: details.results });
+	rememberForegroundRun(deps.state, { runId, mode: "single", cwd: effectiveCwd, childCwds: [r.cwd ?? effectiveCwd], results: details.results });
 
 	if (!r.detached && !r.interrupted) {
 		if (foregroundControl) updateForegroundNestedProjection(foregroundControl);
@@ -3098,7 +3156,10 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		onUpdate: ((r: AgentToolResult<Details>) => void) | undefined,
 		ctx: ExtensionContext,
 	) => Promise<AgentToolResult<Details>>;
+	continueStoredChild: (input: { record: import("../shared/child-thread-registry.ts").ChildThreadRecord; message: string; ctx: ExtensionContext; nextRunId: string }) => Promise<AgentToolResult<Details>>;
 } {
+	const childRegistry = deps.childThreadRegistry ?? new ChildThreadRegistry({ filePath: path.join(ASYNC_DIR, "unbound-child-thread-registries", `${randomUUID()}.json`) });
+	deps.childThreadRegistry = childRegistry;
 	const execute = async (
 		_id: string,
 		params: SubagentParamsLike,
@@ -3401,6 +3462,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 		try {
 			fs.mkdirSync(sessionRoot, { recursive: true });
+			deps.trustedSessionRoots?.add(sessionRoot);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			return toExecutionErrorResult(
@@ -3426,6 +3488,77 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		const chainBindingsError = validateExecutionChainBindings(effectiveParams, deps.config.chain?.dynamicFanout?.maxItems);
 		if (chainBindingsError) return chainBindingsError;
 
+		const parentSessionId = ctx.sessionManager.getSessionId() ?? deps.state.currentSessionId;
+		if (!parentSessionId) return toExecutionErrorResult(effectiveParams, new Error("Cannot assign child thread identities because the parent Pi session has no session id."));
+		const asyncRunId = effectiveAsync ? randomUUID() : undefined;
+		const identityRunId = asyncRunId ?? runId;
+		let staticChildIdentities: ChildIdentity[];
+		try {
+			staticChildIdentities = collectStaticChildIdentities({
+				runId: identityRunId,
+				handle: effectiveParams.handle,
+				agent: effectiveParams.agent,
+				tasks: effectiveParams.tasks,
+				chain: effectiveParams.chain,
+				dynamicFanoutMaxItems: deps.config.chain?.dynamicFanout?.maxItems,
+			});
+		} catch (error) {
+			return toExecutionErrorResult(effectiveParams, error);
+		}
+
+		const annotateChildThreads = (result: AgentToolResult<Details>, async: boolean): AgentToolResult<Details> => {
+			const now = Date.now();
+			const projected = result.details.results.length > 0
+				? result.details.results.map((child, index) => ({
+					childTarget: child.childTarget ?? childTarget(result.details.runId ?? runId, index),
+					...(child.handle ? { handle: child.handle } : {}),
+					agent: child.agent,
+				}))
+				: staticChildIdentities.map(({ childTarget, handle, agent }) => ({ childTarget, ...(handle ? { handle } : {}), agent }));
+			for (const projection of projected) {
+				const parsed = projection.childTarget.split(":");
+				const index = Number(parsed.at(-1));
+				const run = parsed.slice(0, -1).join(":");
+				const child = result.details.results.find((candidate) => candidate.childTarget === projection.childTarget)
+					?? result.details.results[index];
+				const state: ChildThreadState = async
+					? "running"
+					: child?.detached ? "detached" : child?.interrupted ? "paused" : child?.exitCode === 0 ? "complete" : "failed";
+				const original = staticChildIdentities.find((identity) => identity.childTarget === projection.childTarget)?.childTarget ?? projection.childTarget;
+				try {
+					const existing = childRegistry.resolve(original, parentSessionId);
+					const metadata = {
+						...(projection.handle ? { handle: projection.handle } : {}),
+						state,
+						cwd: child?.cwd ?? existing.cwd,
+						agent: projection.agent ?? child?.agent ?? "unknown",
+						...(child?.sessionFile ? { sessionFile: child.sessionFile } : {}),
+						...(child?.transcriptPath ? { transcriptPath: child.transcriptPath } : {}),
+						...(result.details.asyncDir ? { asyncDir: result.details.asyncDir } : {}),
+						startedAt: now,
+						...(!async ? { endedAt: now } : {}),
+					};
+					if (async) {
+						childRegistry.updateIfLatestInStates(parentSessionId, original, { latestRunId: run, latestIndex: index }, ["queued", "running"], metadata);
+					} else {
+						childRegistry.register({ originalTarget: original, parentSessionId, runId: run, index, ...metadata });
+					}
+				} catch {
+					// Result delivery must not be lost if metadata persistence races with a reload.
+				}
+			}
+			const targetText = projected.length > 0
+				? `Child targets: ${projected.map((entry) => entry.handle ? `${entry.handle}=${entry.childTarget}` : entry.childTarget).join(", ")}`
+				: undefined;
+			return {
+				...result,
+				content: targetText && !result.content.some((entry) => entry.type === "text" && entry.text.includes("Child targets:"))
+					? [...result.content, { type: "text", text: targetText }]
+					: result.content,
+				details: { ...result.details, ...(projected.length > 0 ? { childTargets: projected } : {}) },
+			};
+		};
+
 		const onUpdateWithContext = onUpdate
 			? (r: AgentToolResult<Details>) => onUpdate(withForkContext(r, effectiveParams.context))
 			: undefined;
@@ -3439,6 +3572,26 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			mode: foregroundMode,
 		});
 		if (spawnLimitError) return spawnLimitError;
+		if (effectiveAsync && !isAsyncAvailable()) {
+			return toExecutionErrorResult(effectiveParams, new Error("Async mode requires upstream jiti for TypeScript execution but it could not be found. Ensure the pi-subagents package dependencies are installed."));
+		}
+		try {
+			childRegistry.registerMany(staticChildIdentities.map((identity) => ({
+				originalTarget: identity.childTarget,
+				handle: identity.handle,
+				parentSessionId,
+				runId: identityRunId,
+				index: identity.flatIndex,
+				state: "queued" as const,
+				cwd: resolveChildCwd(effectiveCwd, identity.cwd),
+				agent: identity.agent,
+				sessionFile: childSessionFileForTask(identity.agent, identity.flatIndex),
+				trustedSessionRoot: sessionRoot,
+				...(effectiveAsync ? { asyncDir: path.join(ASYNC_DIR, identityRunId) } : {}),
+			})));
+		} catch (error) {
+			return toExecutionErrorResult(effectiveParams, error);
+		}
 
 		const execData: ExecutionContextData = {
 			params: effectiveParams,
@@ -3448,6 +3601,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			onUpdate: onUpdateWithContext,
 			agents,
 			runId,
+			asyncRunId,
 			shareEnabled,
 			sessionRoot,
 			sessionDirForIndex,
@@ -3550,7 +3704,7 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		let nestedForegroundStarted = false;
 		try {
 			const asyncResult = runAsyncPath(execData, deps);
-			if (asyncResult) return withForkContext(asyncResult, effectiveParams.context);
+			if (asyncResult) return withForkContext(annotateChildThreads(asyncResult, !asyncResult.isError), effectiveParams.context);
 			if (foregroundControl) {
 				writeNestedForegroundEvent("subagent.nested.started");
 				nestedForegroundStarted = true;
@@ -3558,20 +3712,28 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 			if (hasChain && effectiveParams.chain) {
 				const result = await runChainPath(execData, deps);
 				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				return withForkContext(annotateChildThreads(result, false), effectiveParams.context);
 			}
 			if (hasTasks && effectiveParams.tasks) {
 				const result = await runParallelPath(execData, deps);
 				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				return withForkContext(annotateChildThreads(result, false), effectiveParams.context);
 			}
 			if (hasSingle) {
 				const result = await runSinglePath(execData, deps);
 				writeNestedForegroundEvent("subagent.nested.completed", result);
-				return withForkContext(result, effectiveParams.context);
+				return withForkContext(annotateChildThreads(result, false), effectiveParams.context);
 			}
 		} catch (error) {
 			const errorResult = toExecutionErrorResult(effectiveParams, error);
+			const endedAt = Date.now();
+			for (const child of childRegistry.list(parentSessionId).filter((candidate) => candidate.latestRunId === identityRunId)) {
+				try {
+					childRegistry.updateIfLatestInStates(parentSessionId, child.originalTarget, { latestRunId: identityRunId, latestIndex: child.latestIndex }, ["queued", "running"], { state: "failed", endedAt });
+				} catch {
+					// Preserve the execution error when registry cleanup races another process.
+				}
+			}
 			if (nestedForegroundStarted) writeNestedForegroundEvent("subagent.nested.completed", errorResult);
 			return errorResult;
 		} finally {
@@ -3609,5 +3771,30 @@ export function createSubagentExecutor(deps: ExecutorDeps): {
 		}
 	};
 
-	return { execute: executeWithSingleDispatchGuard };
+	const continueStoredChild = async (input: { record: import("../shared/child-thread-registry.ts").ChildThreadRecord; message: string; ctx: ExtensionContext; nextRunId: string }): Promise<AgentToolResult<Details>> => {
+		const sessionFile = input.record.sessionFile;
+		if (!sessionFile) throw new Error(`Child '${input.record.originalTarget}' has no persisted session file.`);
+		const result = await resumeAsyncRun({
+			params: { message: input.message },
+			requestCwd: input.record.cwd,
+			ctx: input.ctx,
+			deps,
+			plannedRunId: input.nextRunId,
+			target: {
+				kind: "revive",
+				source: input.record.asyncDir ? "async" : "foreground",
+				runId: input.record.latestRunId,
+				state: input.record.state === "complete" ? "complete" : input.record.state === "paused" ? "paused" : "failed",
+				agent: input.record.agent,
+				index: input.record.latestIndex,
+				intercomTarget: resolveSubagentIntercomTarget(input.record.latestRunId, input.record.agent, input.record.latestIndex),
+				cwd: input.record.cwd,
+				sessionFile,
+				...(input.record.asyncDir ? { asyncDir: input.record.asyncDir } : {}),
+			},
+		});
+		return result;
+	};
+
+	return { execute: executeWithSingleDispatchGuard, continueStoredChild };
 }

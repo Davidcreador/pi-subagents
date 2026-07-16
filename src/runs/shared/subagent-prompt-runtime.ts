@@ -3,6 +3,7 @@ import * as path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerNativeSupervisorClient } from "../../intercom/native-supervisor-channel.ts";
 import { consumeSteerRequestsFromDir, writeSteerRequestToDir, type SteerRequest } from "../background/control-channel.ts";
+import { controlHeartbeatPath, writeControlHeartbeat } from "./control-heartbeat.ts";
 import { SUBAGENT_FANOUT_CHILD_ENV, SUBAGENT_STEER_INBOX_ENV } from "./pi-args.ts";
 import { STRUCTURED_OUTPUT_CAPTURE_ENV, STRUCTURED_OUTPUT_SCHEMA_ENV, validateStructuredOutputValue } from "./structured-output.ts";
 import { TOOL_BUDGET_ENV, decodeToolBudgetEnv, shouldBlockToolForBudget, toolBudgetBlockedMessage, toolBudgetSoftNudge } from "./tool-budget.ts";
@@ -200,8 +201,23 @@ function registerSteeringInbox(pi: ExtensionAPI): void {
 	let disposed = false;
 	let flushing = false;
 	let started = false;
+	let heartbeatToken: string | undefined;
+	let lastHeartbeatAt = 0;
 	let watcher: fs.FSWatcher | undefined;
 	let interval: NodeJS.Timeout | undefined;
+	const refreshHeartbeat = (): void => {
+		try {
+			const marker = JSON.parse(fs.readFileSync(path.join(steerInbox, "active.json"), "utf-8")) as { token?: unknown; pid?: unknown };
+			if (typeof marker.token !== "string" || marker.pid !== process.pid) return;
+			const now = Date.now();
+			if (heartbeatToken === marker.token && now - lastHeartbeatAt < 1_000) return;
+			heartbeatToken = marker.token;
+			lastHeartbeatAt = now;
+			writeControlHeartbeat(steerInbox, marker.token, process.pid, now);
+		} catch {
+			heartbeatToken = undefined;
+		}
+	};
 	const flush = (): void => {
 		if (disposed || flushing || !canSteer) return;
 		flushing = true;
@@ -228,13 +244,17 @@ function registerSteeringInbox(pi: ExtensionAPI): void {
 			return;
 		}
 		started = true;
+		refreshHeartbeat();
 		try {
 			watcher = fs.watch(steerInbox, () => flush());
 			watcher.on("error", () => {});
 		} catch {
 			watcher = undefined;
 		}
-		interval = setInterval(flush, 250);
+		interval = setInterval(() => {
+			refreshHeartbeat();
+			flush();
+		}, 250);
 		interval.unref?.();
 	};
 	const activate = (): undefined => {
@@ -255,6 +275,9 @@ function registerSteeringInbox(pi: ExtensionAPI): void {
 			watcher?.close();
 		} catch {}
 		if (interval) clearInterval(interval);
+		if (heartbeatToken) {
+			try { fs.rmSync(controlHeartbeatPath(steerInbox), { force: true }); } catch {}
+		}
 	});
 }
 

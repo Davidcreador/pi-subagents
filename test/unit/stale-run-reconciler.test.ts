@@ -42,7 +42,7 @@ describe("async stale-run reconciliation", () => {
 				startedAt: 1000,
 				lastUpdate: 1000,
 				currentStep: 0,
-				steps: [{ agent: "scout", status: "running", startedAt: 1000 }],
+				steps: [{ agent: "scout", childTarget: "run-dead:0", handle: "scout-thread", status: "running", startedAt: 1000 }],
 			});
 
 			const result = reconcileAsyncRun(asyncDir, {
@@ -64,6 +64,8 @@ describe("async stale-run reconciliation", () => {
 			assert.equal(resultJson.sessionId, "session-current");
 			assert.equal(resultJson.state, "failed");
 			assert.equal(resultJson.exitCode, 1);
+			assert.equal(resultJson.results[0].childTarget, "run-dead:0");
+			assert.equal(resultJson.results[0].handle, "scout-thread");
 			assert.match(resultJson.summary, /process 12345 exited or disappeared/);
 			assert.match(fs.readFileSync(path.join(asyncDir, "events.jsonl"), "utf-8"), /subagent\.run\.repaired_stale/);
 		} finally {

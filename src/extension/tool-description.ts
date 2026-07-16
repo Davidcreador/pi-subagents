@@ -16,14 +16,19 @@ export const SUBAGENT_SAFETY_GUIDANCE = `SAFETY-CRITICAL SUBAGENT GUIDANCE:
 
 export const FULL_SUBAGENT_TOOL_DESCRIPTION = `Delegate to subagents or manage agent definitions.
 
+PROACTIVE USE:
+• Decide without waiting for explicit user syntax. For non-trivial work, use a configured subagent when independent investigation, specialist judgment, or fresh read-only review would materially improve correctness, coverage, or confidence.
+• Prefer one focused child; use a small parallel fanout only for genuinely independent workstreams. Do not delegate trivial or mechanical work the parent can complete confidently in one step, and never create concurrent writers in the same cwd/worktree.
+
 EXECUTION (use exactly ONE mode):
 • Before executing, use { action: "list" } to inspect configured agents/chains. Only execute agents listed as executable/non-disabled.
-• SINGLE: { agent, task? } - one task; omit task for self-contained agents
-• CHAIN: { chain: [{agent:"agent-a"}, {parallel:[{agent:"agent-b",count:3}]}] } - sequential pipeline with optional parallel fan-out
-• PARALLEL: { tasks: [{agent,task,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
+• SINGLE: { agent, task?, handle? } - one task; omit task for self-contained agents
+• CHAIN: { chain: [{agent:"agent-a",handle:"draft"}, {parallel:[{agent:"agent-b",handle:"review",count:3}]}] } - sequential pipeline with optional parallel fan-out
+• PARALLEL: { tasks: [{agent,task,handle?,count?,output?,reads?,progress?}, ...], concurrency?: number, worktree?: true } - concurrent execution (worktree: isolate each task in a git worktree)
 • Optional context: { context: "fresh" | "fork" } (explicit value overrides every child; when omitted, each requested agent uses its own defaultContext, otherwise "fresh"; inspect agent defaults via { action: "list" })
 • Optional timeout: { timeoutMs } or { maxRuntimeMs } sets a run-level max runtime for foreground and async/background runs
-• If { action: "list" } shows proactive skill subagent suggestions, consider a small fresh-context fanout for broad tasks where one of those skills would materially help
+• Every child result exposes canonical childTarget runId:flatIndex and an optional parent-session handle. Use send_message({target,message}) to steer that exact active child or continue its validated persisted session.
+• If { action: "list" } shows proactive skill subagent suggestions, treat them as agent-selection hints, not as a reason by themselves to delegate
 
 CHAIN TEMPLATE VARIABLES (use in task strings):
 • {task} - The original task/request from the user
@@ -67,16 +72,21 @@ ${SUBAGENT_SAFETY_GUIDANCE}`;
 
 export const COMPACT_SUBAGENT_TOOL_DESCRIPTION = `Delegate to subagents or manage definitions. Use exactly one mode per call.
 
+PROACTIVE USE:
+• Decide without waiting for explicit user syntax. For non-trivial work, use a configured subagent when independent investigation, specialist judgment, or fresh read-only review would materially improve correctness, coverage, or confidence.
+• Prefer one focused child; use a small parallel fanout only for genuinely independent workstreams. Do not delegate trivial or mechanical work the parent can complete confidently in one step, and never create concurrent writers in the same cwd/worktree.
+
 EXECUTE:
 • Before execution, call { action: "list" }; run only executable/non-disabled configured agents/chains.
-• SINGLE {agent, task?}; PARALLEL {tasks:[{agent,task,count?,output?,reads?,progress?}], concurrency?, worktree?}; CHAIN {chain:[{agent,task?},{parallel:[...]}]}.
+• SINGLE {agent, task?, handle?}; PARALLEL {tasks:[{agent,task,handle?,count?,output?,reads?,progress?}], concurrency?, worktree?}; CHAIN {chain:[{agent,task?,handle?},{parallel:[...]}]}. Optional handles are unique in the parent session; count expands a base handle to handle-1, handle-2, etc.
 • context can be "fresh" or "fork"; omitted uses each agent defaultContext, otherwise fresh. timeoutMs/maxRuntimeMs apply to foreground and async/background runs.
 • Chain templates may use {task}, {previous}, {chain_dir}, and named outputs. Parallel worktree isolation requires a clean git repo.
-• If list shows proactive skill subagent suggestions, use a small fresh-context fanout only when the task is broad enough.
+• If list shows proactive skill subagent suggestions, treat them as agent-selection hints, not as a reason by themselves to delegate.
 
 MANAGE / CONTROL:
 • Use action without execution fields: list, get, models, create, update, delete, eject, disable, enable, reset, doctor.
 • Async control actions: status, interrupt, resume, steer, append-step. Use status view:"fleet" for active-run overview, view:"transcript" to tail child output, and steer for non-terminal live guidance. Use id/runId prefixes carefully; use index for a specific child.
+• Every child result exposes canonical childTarget runId:flatIndex and optional handle. Prefer send_message({target,message}) to steer that exact active child or continue its persisted settled thread.
 • Opt-in schedule actions: schedule, schedule-list, schedule-status, schedule-cancel. Schedule only explicit delayed runs the user asked for.
 
 ASYNC / WAIT:
@@ -103,7 +113,7 @@ export interface ToolDescriptionOptions {
 
 export function resolveToolDescriptionMode(config: Pick<ExtensionConfig, "toolDescriptionMode">, options?: ToolDescriptionOptions): ToolDescriptionMode {
 	const mode = config.toolDescriptionMode;
-	if (mode === undefined) return "full";
+	if (mode === undefined) return "compact";
 	if (isToolDescriptionMode(mode)) return mode;
 	warn(options, `Ignoring invalid toolDescriptionMode ${JSON.stringify(mode)}; expected "full", "compact", or "custom".`);
 	return "full";

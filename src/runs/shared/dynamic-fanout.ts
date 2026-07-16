@@ -42,10 +42,10 @@ const ITEM_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const ITEM_REF_PATTERN = /\{([A-Za-z_][A-Za-z0-9_]*)(?:\.([^{}]+))?\}/g;
 const RESERVED_TEMPLATE_NAMES = new Set(["task", "previous", "chain_dir", "outputs"]);
 const DYNAMIC_STEP_KEYS = new Set(["expand", "parallel", "collect", "concurrency", "failFast", "phase", "label", "acceptance"]);
-const RUNNER_DYNAMIC_STEP_KEYS = new Set([...DYNAMIC_STEP_KEYS, "effectiveAcceptance", "sessionFiles", "thinkingOverrides"]);
+const RUNNER_DYNAMIC_STEP_KEYS = new Set([...DYNAMIC_STEP_KEYS, "effectiveAcceptance", "sessionFiles", "thinkingOverrides", "startIndex", "reservedItems"]);
 const DYNAMIC_EXPAND_KEYS = new Set(["from", "item", "key", "maxItems", "onEmpty"]);
 const DYNAMIC_EXPAND_FROM_KEYS = new Set(["output", "path"]);
-const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "phase", "label", "outputSchema", "cwd", "output", "outputMode", "reads", "progress", "skill", "model", "toolBudget", "acceptance"]);
+const DYNAMIC_PARALLEL_KEYS = new Set(["agent", "task", "handle", "phase", "label", "outputSchema", "cwd", "output", "outputMode", "reads", "progress", "skill", "model", "toolBudget", "acceptance"]);
 const RUNNER_DYNAMIC_PARALLEL_KEYS = new Set([
 	...DYNAMIC_PARALLEL_KEYS,
 	"outputName", "structured", "inheritProjectContext", "inheritSkills", "skills", "outputPath", "maxSubagentDepth",
@@ -182,6 +182,12 @@ export function hasDynamicFanoutFields(step: unknown): boolean {
 export function validateDynamicStepShape(step: DynamicParallelStep, stepIndex: number, config: DynamicFanoutConfig = {}): void {
 	const prefix = `Dynamic chain step ${stepIndex + 1}`;
 	assertOnlyKeys(step, config.allowRunnerFields ? RUNNER_DYNAMIC_STEP_KEYS : DYNAMIC_STEP_KEYS, prefix);
+	if (config.allowRunnerFields) {
+		const runnerStep = step as DynamicParallelStep & { startIndex?: unknown; reservedItems?: unknown };
+		for (const key of ["startIndex", "reservedItems"] as const) {
+			if (runnerStep[key] !== undefined && (!Number.isInteger(runnerStep[key]) || (runnerStep[key] as number) < 0)) throw new DynamicFanoutError(`${prefix} ${key} must be an integer >= 0.`);
+		}
+	}
 	if (!step.expand || !step.expand.from) throw new DynamicFanoutError(`${prefix} requires expand.from.`);
 	assertOnlyKeys(step.expand, DYNAMIC_EXPAND_KEYS, `${prefix} expand`);
 	assertOnlyKeys(step.expand.from, DYNAMIC_EXPAND_FROM_KEYS, `${prefix} expand.from`);
@@ -208,6 +214,7 @@ export function validateDynamicStepShape(step: DynamicParallelStep, stepIndex: n
 	for (const [label, template] of [
 		["parallel.task", step.parallel.task],
 		["parallel.label", step.parallel.label],
+		["parallel.handle", step.parallel.handle],
 	] as const) {
 		if (template) assertNoUnresolvedItemReferences(template, itemName, `${prefix} ${label}`);
 	}
@@ -251,10 +258,12 @@ export function materializeDynamicParallelStep(step: DynamicParallelStep, output
 	const parallel = items.map((entry) => {
 		const task = resolveItemTemplate(step.parallel.task ?? "{previous}", itemName, entry.item);
 		const label = step.parallel.label ? resolveItemTemplate(step.parallel.label, itemName, entry.item) : undefined;
+		const handle = step.parallel.handle ? resolveItemTemplate(step.parallel.handle, itemName, entry.item) : undefined;
 		return {
 			...step.parallel,
 			task,
 			...(label !== undefined ? { label } : {}),
+			...(handle !== undefined ? { handle } : {}),
 		};
 	});
 	return { items, parallel };

@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	fauxAssistantMessage,
 	fauxText,
-	registerFauxProvider,
 } from "@earendil-works/pi-ai";
 import {
 	createAgentSession,
@@ -85,6 +85,14 @@ function parseArgs(argv) {
 	return parsed;
 }
 
+// Register against AgentSession's pi-ai instance when coding-agent carries nested runtime dependencies.
+async function loadCodingAgentFauxRegistrar() {
+	const codingAgentEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	const nestedCompat = path.resolve(path.dirname(codingAgentEntry), "..", "node_modules", "@earendil-works", "pi-ai", "dist", "compat.js");
+	const compat = await import(fs.existsSync(nestedCompat) ? pathToFileURL(nestedCompat).href : "@earendil-works/pi-ai/compat");
+	return compat.registerFauxProvider;
+}
+
 function createModelRegistry(model) {
 	return {
 		find: (provider, id) => provider === model.provider && id === model.id ? model : undefined,
@@ -112,20 +120,31 @@ function createSessionManager(parsed, cwd) {
 async function main() {
 	const parsed = parseArgs(process.argv.slice(2));
 	const responseText = process.env.PI_SUBAGENTS_E2E_CHILD_TEXT ?? "CHILD_REAL_SESSION_OK";
+	const continuationText = process.env.PI_SUBAGENTS_E2E_CONTINUATION_TEXT;
+	const isContinuation = Boolean(parsed.sessionFile && fs.existsSync(parsed.sessionFile));
 	const cwd = process.cwd();
 	const ownedAgentDir = process.env.PI_CODING_AGENT_DIR
 		? undefined
 		: mkdtempSync(path.join(os.tmpdir(), "pi-e2e-agent-dir-"));
 	const agentDir = process.env.PI_CODING_AGENT_DIR ?? ownedAgentDir;
 
-	const faux = registerFauxProvider({
+	const registerFauxProvider = await loadCodingAgentFauxRegistrar();
+	const fauxOptions = {
 		provider: "faux-e2e-child",
 		models: [{ id: "child", contextWindow: 200_000 }],
-	});
+	};
+	let faux = registerFauxProvider(fauxOptions);
 	const model = faux.getModel();
-	faux.setResponses([
-		() => fauxAssistantMessage(fauxText(responseText), { stopReason: "stop" }),
-	]);
+	const fauxApi = faux.api;
+	const responses = [
+		(context) => {
+			const continuedWithHistory = !isContinuation || !continuationText || JSON.stringify(context.messages).includes(responseText);
+			const text = isContinuation && continuationText
+				? continuedWithHistory ? continuationText : "CHILD_CONTINUATION_CONTEXT_MISSING"
+				: responseText;
+			return fauxAssistantMessage(fauxText(text), { stopReason: "stop" });
+		},
+	];
 
 	const settingsManager = SettingsManager.inMemory({
 		compaction: { enabled: false },
@@ -169,6 +188,9 @@ async function main() {
 		});
 
 		await session.bindExtensions({});
+		faux.unregister();
+		faux = registerFauxProvider({ ...fauxOptions, api: fauxApi });
+		faux.setResponses(responses);
 		await session.prompt(parsed.prompt ?? "", { expandPromptTemplates: false });
 		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
 		session.dispose();

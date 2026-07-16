@@ -4,7 +4,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
 import {
-	ASYNC_RESUME_INTERRUPT_SIGNAL,
 	interruptLiveAsyncResumeTarget,
 	resolveAsyncResumeTarget,
 } from "../../src/runs/background/async-resume.ts";
@@ -15,7 +14,7 @@ function writeJson(filePath: string, value: object): void {
 }
 
 describe("live async resume interrupt", () => {
-	it("interrupts a resolved live async child before the caller sends a follow-up", () => {
+	it("queues an interrupt without signaling the pid recovered for a live async child", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-async-resume-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -58,7 +57,7 @@ describe("live async resume interrupt", () => {
 			});
 
 			assert.deepEqual(result, { ok: true, asyncId: "run-live" });
-			assert.deepEqual(kills, [{ pid: process.pid, signal: 0 }, { pid: process.pid, signal: ASYNC_RESUME_INTERRUPT_SIGNAL }]);
+			assert.deepEqual(kills, [{ pid: process.pid, signal: 0 }]);
 			assert.equal(state.asyncJobs.get("run-live")?.activityState, undefined);
 			assert.equal(state.asyncJobs.get("run-live")?.updatedAt, 1234);
 			// The portable control request is dropped regardless of the signal path.
@@ -68,7 +67,7 @@ describe("live async resume interrupt", () => {
 		}
 	});
 
-	it("still interrupts a live async child when the OS signal is unavailable (ENOSYS on Windows)", () => {
+	it("still queues an interrupt when pid liveness cannot be determined", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-live-async-resume-enosys-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
@@ -110,7 +109,7 @@ describe("live async resume interrupt", () => {
 				},
 			});
 
-			// The signal failed, but the file-based control inbox makes the interrupt succeed.
+			// The file-based control inbox remains authoritative when liveness is unknown.
 			assert.deepEqual(result, { ok: true, asyncId: "run-live" });
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
 			assert.equal(state.asyncJobs.get("run-live")?.activityState, undefined);
@@ -158,7 +157,7 @@ describe("live async resume interrupt", () => {
 				},
 			});
 
-			assert.deepEqual(result, { ok: false, message: "Async run run-live is live but no interrupt-capable runner pid was found." });
+			assert.deepEqual(result, { ok: false, message: "Async run run-live is not running." });
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), false);
 			const repairedStatus = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 			assert.equal(repairedStatus.state, "failed");

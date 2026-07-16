@@ -92,9 +92,12 @@ const ToolBudgetOverride = Type.Object({
 	block: Type.Optional(ToolBudgetBlock),
 }, { additionalProperties: false, description: "Optional child tool-call budget. soft nudges the child; after hard, block tools (default read/grep/find/ls, or '*' for all tools) are blocked so the child can finalize." });
 
+const Handle = Type.String({ pattern: "^[A-Za-z][A-Za-z0-9_-]{0,63}$", description: "Optional parent-session-unique child alias. Start with a letter; use only letters, numbers, '_' or '-'; max 64 characters. With count > 1, expands to handle-1, handle-2, etc." });
+
 const TaskItem = Type.Object({
 	agent: Type.String(), 
-	task: Type.String(), 
+	task: Type.String(),
+	handle: Type.Optional(Handle),
 	cwd: Type.Optional(Type.String()),
 	count: Type.Optional(Type.Integer({ minimum: 1, description: "Repeat this parallel task N times with the same settings." })),
 	output: Type.Optional(OutputOverride),
@@ -110,6 +113,7 @@ const TaskItem = Type.Object({
 // Parallel task item (within a parallel step)
 const ParallelTaskSchema = Type.Object({
 	agent: Type.String(),
+	handle: Type.Optional(Handle),
 	task: Type.Optional(Type.String({ description: "Task template with {task}, {previous}, {chain_dir} variables. Defaults to {previous}." })),
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label for this parallel task." })),
@@ -140,6 +144,7 @@ const DynamicExpandSchema = Type.Object({
 
 const DynamicParallelTemplateSchema = Type.Object({
 	agent: Type.String(),
+	handle: Type.Optional(Type.String({ description: "Optional handle template using the dynamic item variable (for example worker-{item.id}); each resolved handle must use only letters, numbers, '_' or '-', start with a letter, and be unique in the parent session." })),
 	task: Type.Optional(Type.String({ description: "Task template with {item}, {item.path}, {task}, {previous}, {chain_dir}, and {outputs.name} variables." })),
 	phase: Type.Optional(Type.String({ description: "Optional phase/group label for status and graph rendering." })),
 	label: Type.Optional(Type.String({ description: "Optional user-facing label; item templates are supported." })),
@@ -163,6 +168,7 @@ const DynamicCollectSchema = Type.Object({
 // Flattened so chain steps do not need an object-shape anyOf/oneOf union.
 const ChainItem = Type.Object({
 	agent: Type.Optional(Type.String({ description: "Sequential step agent name" })),
+	handle: Type.Optional(Handle),
 	task: Type.Optional(Type.String({
 		description: "Task template with variables: {task}=original request, {previous}=prior step's text response, {chain_dir}=shared folder, {outputs.name}=prior named output. Required for first step, defaults to '{previous}' for subsequent steps."
 	})),
@@ -214,6 +220,7 @@ const ControlOverrides = Type.Object({
 });
 
 const SubagentParamsSchema = Type.Object({
+	handle: Type.Optional(Handle),
 	agent: Type.Optional(Type.String({ description: "Agent name (SINGLE mode) or target for management get/update/delete" })),
 	task: Type.Optional(Type.String({ description: "Task (SINGLE mode, optional for self-contained agents)" })),
 	// Management action (when present, tool operates in management mode)
@@ -250,12 +257,12 @@ const SubagentParamsSchema = Type.Object({
 		],
 		description: "Agent/chain config for create/update. Object or JSON string; presence of steps creates a chain."
 	})),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, count?, output?, outputMode?, reads?, progress?}, ...]" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "PARALLEL mode: [{agent, task, handle?, count?, ...}]. Handles start with a letter, use only letters/numbers/_/-, max 64 chars, and are unique in the parent session; count expands handle to handle-1, handle-2, etc." })),
 	concurrency: Type.Optional(Type.Integer({ minimum: 1, description: "Top-level PARALLEL mode only: max concurrent tasks. Defaults to config.parallel.concurrency or 4." })),
 	worktree: Type.Optional(Type.Boolean({
 		description: "Create isolated git worktrees for parallel tasks; requires clean git state."
 	})),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: sequential steps; each result becomes {previous}. append-step takes one tail step and may use {chain_dir}/{outputs.name}." })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "CHAIN mode: sequential/static-parallel children accept optional safe parent-session-unique handles (letter first; letters/numbers/_/-; max 64). Dynamic handle templates may interpolate the item variable and must resolve uniquely before launch. Each result becomes {previous}." })),
 	context: Type.Optional(Type.String({
 		enum: ["fresh", "fork"],
 		description: "'fresh' or 'fork' to branch from parent session. Explicit context overrides every child in the invocation. If omitted, each requested agent uses its own defaultContext; agents without defaultContext: 'fork' run fresh.",
@@ -307,3 +314,8 @@ const WaitParamsSchema = Type.Object({
 });
 
 export const WaitParams = keepTopLevelParameterDescriptions(WaitParamsSchema);
+
+export const SendMessageParams = Type.Object({
+	target: Type.String({ minLength: 1, description: "Exact canonical child target (runId:flatIndex), or a friendly handle from the current parent session." }),
+	message: Type.String({ minLength: 1, description: "Guidance for the exact child thread. Active children are steered; settled children continue their persisted session as a new async turn." }),
+}, { additionalProperties: false });

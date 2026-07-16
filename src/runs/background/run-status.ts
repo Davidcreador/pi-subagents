@@ -373,6 +373,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 				const display = step.label ? `${step.label} (${step.agent})` : step.agent;
 				const phase = step.phase ? `[${step.phase}] ` : "";
 				lines.push(`${stepLineLabel(status, index)}: ${phase}${display} ${step.status}${modelText}${stepActivityText ? `, ${stepActivityText}` : ""}${steeringSuffix}${acceptanceText}${budgetText}${errorText}`);
+				lines.push(`  Child target: ${step.childTarget ?? `${status.runId}:${index}`}${step.handle ? ` (handle: ${step.handle})` : ""}`);
 				lines.push(...formatNestedRunStatusLines(step.children, { indent: "  ", commandHints: true, maxLines: 20 }));
 				const stepOutputPath = path.join(asyncDir, `output-${index}.log`);
 				if (stepOutputPath !== outputPath && fs.existsSync(stepOutputPath)) lines.push(`  Output: ${stepOutputPath}`);
@@ -400,7 +401,7 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 	if (resultPath) {
 		try {
 			const raw = fs.readFileSync(resultPath, "utf-8");
-			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; sessionFile?: string; results?: Array<{ agent?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null }> };
+			const data = JSON.parse(raw) as { id?: string; runId?: string; agent?: string; success?: boolean; summary?: string; output?: string; exitCode?: number; state?: string; sessionFile?: string; results?: Array<{ agent?: string; childTarget?: string; handle?: string; output?: string; summary?: string; sessionFile?: string; state?: string; success?: boolean; exitCode?: number | null }> };
 			if (params.view === "transcript") {
 				try {
 					return { content: [{ type: "text", text: formatAsyncResultTranscript(data, resultPath, { index: params.index, lines: params.lines }) }], details: { mode: "single", results: [] } };
@@ -413,6 +414,10 @@ export function inspectSubagentStatus(params: RunStatusParams, deps: RunStatusDe
 			const runId = data.runId ?? data.id ?? resolvedId;
 			const lines = [`Run: ${runId}`, `State: ${status}`, `Result: ${resultPath}`];
 			const children = Array.isArray(data.results) ? data.results : data.agent ? [{ agent: data.agent, sessionFile: data.sessionFile }] : [];
+			const childTargets = children.flatMap((child, index) => child.childTarget || child.handle
+				? [`  ${child.childTarget ?? `${runId}:${index}`}${child.handle ? ` (handle: ${child.handle})` : ""} — ${child.agent ?? "subagent"}`]
+				: []);
+			if (childTargets.length > 0) lines.push("Child targets:", ...childTargets);
 			lines.push(formatResumeGuidance(runId, children, data.sessionFile));
 			if (data.summary) lines.push("", data.summary);
 			return { content: [{ type: "text", text: lines.join("\n") }], details: { mode: "single", results: [] } };

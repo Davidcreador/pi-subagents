@@ -6,6 +6,7 @@ import type { MockPi } from "../support/helpers.ts";
 import { createEventBus, createMockPi, createTempDir, events, removeTempDir, tryImport } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT } from "../../src/shared/types.ts";
+import { ChildThreadRegistry } from "../../src/runs/shared/child-thread-registry.ts";
 
 interface ExecutorModule {
 	createSubagentExecutor?: (...args: unknown[]) => {
@@ -129,7 +130,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		}), config);
 	}
 
-	function makeExecutorWithDiscoverAgents(discoverAgentsImpl: typeof discoverAgents, config: Record<string, unknown> = {}) {
+	function makeExecutorWithDiscoverAgents(discoverAgentsImpl: typeof discoverAgents, config: Record<string, unknown> = {}, childThreadRegistry?: ChildThreadRegistry) {
 		let sessionName: string | undefined;
 		const eventsApi = createEventBus();
 		return Object.assign(createSubagentExecutor({
@@ -141,6 +142,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 				},
 				sendMessage: () => {},
 			},
+			childThreadRegistry,
 			state: makeState(tempDir),
 			config,
 			asyncByDefault: false,
@@ -435,12 +437,13 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 	it("keeps default-fork context on run-path errors", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
 		const { manager } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
+		const childThreadRegistry = new ChildThreadRegistry({ filePath: path.join(tempDir, "child-threads.json") });
 		const executor = makeExecutorWithDiscoverAgents(() => ({
 			agents: [
 				{ name: "worker", description: "Worker", defaultContext: "fork" },
 			],
 			projectAgentsDir: null,
-		}));
+		}), {}, childThreadRegistry);
 
 		const ctx = makeCtx(manager);
 		ctx.modelRegistry.getAvailable = () => {
@@ -458,6 +461,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.equal(result.isError, true);
 		assert.match(result.content[0]?.text ?? "", /model registry unavailable/);
 		assert.equal(result.details?.context, "fork");
+		assert.deepEqual(childThreadRegistry.list("session-123").map((record) => record.state), ["failed"]);
 	});
 
 	it("keeps explicit fresh context over agent defaultContext fork", async () => {

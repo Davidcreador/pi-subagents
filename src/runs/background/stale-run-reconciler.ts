@@ -105,6 +105,8 @@ function readStatusFile(asyncDir: string): AsyncStatus | null {
 
 interface ResultChildOutcome {
 	agent?: string;
+	childTarget?: string;
+	handle?: string;
 	success?: boolean;
 	error?: string;
 	sessionFile?: string;
@@ -147,6 +149,8 @@ function terminalStatusFromResult(status: AsyncStatus, resultPath: string, now: 
 		return {
 			...step,
 			status: state === "complete" ? "complete" as const : state,
+			childTarget: step.childTarget ?? child?.childTarget,
+			handle: step.handle ?? child?.handle,
 			endedAt: step.endedAt ?? now,
 			durationMs: step.startedAt !== undefined && step.durationMs === undefined ? Math.max(0, now - step.startedAt) : step.durationMs,
 			exitCode: step.exitCode ?? (state === "complete" || state === "paused" ? 0 : 1),
@@ -233,6 +237,8 @@ function buildFailedRepair(status: AsyncStatus, asyncDir: string, now: number, r
 			summary: message,
 			results: repairedSteps.map((step) => ({
 				agent: step.agent,
+				childTarget: step.childTarget,
+				handle: step.handle,
 				output: step.status === "complete" || step.status === "completed" ? "" : message,
 				error: step.status === "complete" || step.status === "completed" ? undefined : step.error ?? message,
 				success: step.status === "complete" || step.status === "completed",

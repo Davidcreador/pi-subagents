@@ -149,6 +149,7 @@ interface AsyncChainParams {
 interface AsyncSingleParams {
 	agent: string;
 	task?: string;
+	handle?: string;
 	agentConfig: AgentConfig;
 	ctx: AsyncExecutionContext;
 	cwd?: string;
@@ -462,6 +463,8 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 			parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 			agent: s.agent,
 			task,
+			...(flatIndex !== undefined ? { childTarget: `${id}:${flatIndex}` } : {}),
+			...(s.handle ? { handle: s.handle } : {}),
 			phase: s.phase,
 			label: s.label,
 			outputName: s.as,
@@ -552,11 +555,14 @@ export function buildAsyncRunnerSteps(id: string, params: AsyncRunnerStepBuildPa
 					progressInstructionCreated = true;
 				}
 				const maxItems = s.expand.maxItems ?? params.dynamicFanoutMaxItems ?? 0;
+				const startIndex = flatStepIndex;
 				const dynamicFlatSteps = Array.from({ length: maxItems }, () => nextFlatStep());
 				return {
 					expand: s.expand,
 					parallel: buildSeqStep(s.parallel as SequentialStep, undefined, undefined, progressPrecreated, behavior),
 					collect: s.collect,
+					startIndex,
+					reservedItems: maxItems,
 					concurrency: s.concurrency,
 					failFast: s.failFast,
 					phase: s.phase,
@@ -706,8 +712,10 @@ export function executeAsyncChain(
 				artifactConfig,
 				share: shareEnabled,
 				sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
+				trustedSessionRoot: sessionRoot,
 				asyncDir,
 				sessionId: ctx.currentSessionId,
+				parentThreadSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 				piPackageRoot,
 				piArgv1: process.argv[1],
 				worktreeSetupHook,
@@ -933,6 +941,8 @@ export function executeAsyncSingle(
 						parentSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 						agent,
 						task: taskWithOutputInstruction,
+						childTarget: `${id}:0`,
+						...(params.handle ? { handle: params.handle } : {}),
 						cwd: runnerCwd,
 						model,
 						thinking: resolveEffectiveThinking(model, effectiveThinking),
@@ -971,8 +981,10 @@ export function executeAsyncSingle(
 				artifactConfig,
 				share: shareEnabled,
 				sessionDir: sessionRoot ? path.join(sessionRoot, `async-${id}`) : undefined,
+				trustedSessionRoot: sessionRoot,
 				asyncDir,
 				sessionId: ctx.currentSessionId,
+				parentThreadSessionId: ctx.parentSessionId ?? ctx.currentSessionId,
 				piPackageRoot,
 				piArgv1: process.argv[1],
 				worktreeSetupHook,

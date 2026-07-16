@@ -109,6 +109,73 @@ describe("wait tool", () => {
 		}
 	});
 
+	it("waits for a tracked launch before its first status file exists", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-startup-race-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			const asyncDir = path.join(asyncRoot, "run-starting");
+			fs.mkdirSync(asyncDir, { recursive: true });
+			state.asyncJobs.set("run-starting", {
+				asyncId: "run-starting",
+				asyncDir,
+				status: "queued",
+				sessionId: "sess-1",
+				mode: "single",
+				startedAt: Date.now(),
+			});
+			let polls = 0;
+			const sleep = async () => {
+				polls += 1;
+				if (polls === 1) {
+					writeStatus(asyncRoot, "run-starting", "running", { sessionId: "sess-1", pid: 999999 });
+					state.asyncJobs.get("run-starting")!.status = "running";
+				}
+				if (polls === 2) {
+					writeStatus(asyncRoot, "run-starting", "complete", { sessionId: "sess-1" });
+					state.asyncJobs.get("run-starting")!.status = "complete";
+				}
+			};
+
+			const result = await waitForSubagents({ all: true }, undefined, baseDeps(root, state, { sleep }));
+			assert.equal(result.isError, undefined);
+			assert.doesNotMatch(textOf(result), /nothing to wait for/i);
+			assert.match(textOf(result), /1 complete/);
+			assert.ok(polls >= 2);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("does not re-add a terminal run from stale in-memory tracker state", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-terminal-tracker-race-"));
+		try {
+			const asyncRoot = path.join(root, "runs");
+			const state = makeState("sess-1");
+			const asyncDir = path.join(asyncRoot, "run-finished");
+			writeStatus(asyncRoot, "run-finished", "complete", { sessionId: "sess-1" });
+			state.asyncJobs.set("run-finished", {
+				asyncId: "run-finished",
+				asyncDir,
+				status: "running",
+				sessionId: "sess-1",
+				mode: "single",
+				startedAt: Date.now(),
+			});
+			let slept = false;
+
+			const result = await waitForSubagents({ all: true, timeoutMs: 5 }, undefined, baseDeps(root, state, {
+				sleep: async () => { slept = true; },
+			}));
+
+			assert.equal(result.isError, undefined);
+			assert.match(textOf(result), /nothing to wait for/i);
+			assert.equal(slept, false);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	it("with all:true, resolves once every active run reaches a terminal state", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-wait-resolve-"));
 		try {

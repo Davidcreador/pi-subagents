@@ -1,7 +1,7 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
 	type AssistantMessage,
 	type Context,
@@ -10,7 +10,6 @@ import {
 	fauxAssistantMessage,
 	fauxText,
 	fauxToolCall,
-	registerFauxProvider,
 	type ToolCall,
 } from "@earendil-works/pi-ai";
 import {
@@ -26,12 +25,25 @@ import {
 const EXTENSION_PATH = fileURLToPath(new URL("../../src/extension/index.ts", import.meta.url));
 const CHILD_CLI_PATH = fileURLToPath(new URL("./real-session-child-cli.mjs", import.meta.url));
 
+type RegisterFauxProvider = typeof import("@earendil-works/pi-ai/compat").registerFauxProvider;
+type FauxProviderRegistration = ReturnType<RegisterFauxProvider>;
+
+// The compat provider registry is module-local, and npm may install Pi's runtime copy below coding-agent.
+// Register the faux API in the same module instance that AgentSession uses, with a deduped fallback.
+async function loadCodingAgentFauxRegistrar(): Promise<RegisterFauxProvider> {
+	const codingAgentEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
+	const nestedCompat = path.resolve(path.dirname(codingAgentEntry), "..", "node_modules", "@earendil-works", "pi-ai", "dist", "compat.js");
+	const compat = await import(existsSync(nestedCompat) ? pathToFileURL(nestedCompat).href : "@earendil-works/pi-ai/compat") as { registerFauxProvider: RegisterFauxProvider };
+	return compat.registerFauxProvider;
+}
+
 export type FauxReply = string | FauxContentBlock | FauxContentBlock[] | AssistantMessage;
 export type FauxResponder = (context: Context, state: { callCount: number }) => FauxReply | Promise<FauxReply>;
 
 export interface RealSessionRunOptions {
 	prompt: string;
 	childText: string;
+	continuationText?: string;
 	respond: FauxResponder;
 	timeoutMs?: number;
 }
@@ -39,6 +51,7 @@ export interface RealSessionRunOptions {
 export interface RealSessionRun {
 	responseText: string;
 	parentSession: AgentSession;
+	agentDir: string;
 	modelCalls: number;
 	dispose: () => Promise<void>;
 }
@@ -111,11 +124,12 @@ function createModelRegistry(model: { provider: string; id: string }) {
 	};
 }
 
-function installChildPiShim(childText: string): () => void {
+function installChildPiShim(childText: string, continuationText?: string): () => void {
 	const rootDir = mkdtempSync(path.join(os.tmpdir(), "pi-real-session-cli-"));
 	const binDir = path.join(rootDir, "bin");
 	const previousPath = process.env.PATH;
 	const previousChildText = process.env.PI_SUBAGENTS_E2E_CHILD_TEXT;
+	const previousContinuationText = process.env.PI_SUBAGENTS_E2E_CONTINUATION_TEXT;
 	const previousArgv1 = process.argv[1];
 
 	writeFileSync(path.join(rootDir, ".keep"), "");
@@ -132,6 +146,7 @@ function installChildPiShim(childText: string): () => void {
 
 	process.env.PATH = `${binDir}${path.delimiter}${previousPath ?? ""}`;
 	process.env.PI_SUBAGENTS_E2E_CHILD_TEXT = childText;
+	setEnv("PI_SUBAGENTS_E2E_CONTINUATION_TEXT", continuationText);
 	if (process.platform === "win32") process.argv[1] = CHILD_CLI_PATH;
 
 	return () => {
@@ -139,6 +154,7 @@ function installChildPiShim(childText: string): () => void {
 		else process.env.PATH = previousPath;
 		if (previousChildText === undefined) delete process.env.PI_SUBAGENTS_E2E_CHILD_TEXT;
 		else process.env.PI_SUBAGENTS_E2E_CHILD_TEXT = previousChildText;
+		setEnv("PI_SUBAGENTS_E2E_CONTINUATION_TEXT", previousContinuationText);
 		if (process.platform === "win32") {
 			if (previousArgv1 === undefined) delete process.argv[1];
 			else process.argv[1] = previousArgv1;
@@ -173,9 +189,9 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		["PI_SUBAGENT_PI_BINARY", process.env.PI_SUBAGENT_PI_BINARY],
 		["PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT", process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT],
 	]);
-	const uninstallChildPi = installChildPiShim(options.childText);
+	const uninstallChildPi = installChildPiShim(options.childText, options.continuationText);
 	let session: AgentSession | undefined;
-	let faux: ReturnType<typeof registerFauxProvider> | undefined;
+	let faux: FauxProviderRegistration | undefined;
 	let disposed = false;
 
 	const dispose = async () => {
@@ -211,14 +227,16 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		delete process.env.PI_SUBAGENT_PI_BINARY;
 		delete process.env.PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT;
 
-		faux = registerFauxProvider({
+		const registerFauxProvider = await loadCodingAgentFauxRegistrar();
+		const fauxOptions = {
 			provider: "faux-e2e-parent",
 			models: [{ id: "parent", contextWindow: 200_000 }],
-		});
+		};
+		faux = registerFauxProvider(fauxOptions);
 		const model = faux.getModel();
+		const fauxApi = faux.api;
 		const respond = options.respond;
 		const responseFactory: FauxResponseStep = async (context, _streamOptions, state) => toAssistantMessage(await respond(context, state));
-		faux.setResponses(Array.from({ length: 8 }, () => responseFactory));
 
 		const settingsManager = SettingsManager.inMemory({
 			compaction: { enabled: false },
@@ -258,6 +276,11 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		});
 
 		await session.bindExtensions({});
+		// Pi 0.80 reloads the compat provider registry while binding extension resources.
+		// Re-register the same API after binding so the already-selected faux model remains routable.
+		faux.unregister();
+		faux = registerFauxProvider({ ...fauxOptions, api: fauxApi });
+		faux.setResponses(Array.from({ length: 8 }, () => responseFactory));
 		const timeoutMs = options.timeoutMs ?? 30_000;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		try {
@@ -275,6 +298,7 @@ export async function runRealSubagentSession(options: RealSessionRunOptions): Pr
 		return {
 			responseText: responseText.trim() || session.getLastAssistantText()?.trim() || "",
 			parentSession: session,
+			agentDir: home,
 			modelCalls: faux.state.callCount,
 			dispose,
 		};

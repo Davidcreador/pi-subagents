@@ -27,6 +27,7 @@ import {
 } from "../../src/runs/shared/pi-args.ts";
 
 const routes: Array<{ eventSink: string }> = [];
+const fixtureId = (id: string): string => `${id}-${process.pid}`;
 const savedEnv = {
 	[SUBAGENT_PARENT_EVENT_SINK_ENV]: process.env[SUBAGENT_PARENT_EVENT_SINK_ENV],
 	[SUBAGENT_PARENT_CONTROL_INBOX_ENV]: process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV],
@@ -48,13 +49,13 @@ afterEach(() => {
 	}
 });
 
-function trackRoute(rootRunId = "root-run") {
+function trackRoute(rootRunId = fixtureId("root-run")) {
 	const route = createNestedRoute(rootRunId);
 	routes.push(route);
 	return route;
 }
 
-function child(id: string, state: "queued" | "running" | "complete" | "failed" | "paused", ts: number, parentRunId = "root-run") {
+function child(id: string, state: "queued" | "running" | "complete" | "failed" | "paused", ts: number, parentRunId = fixtureId("root-run")) {
 	return {
 		id,
 		parentRunId,
@@ -73,25 +74,25 @@ function child(id: string, state: "queued" | "running" | "complete" | "failed" |
 
 describe("nested route index", () => {
 	it("indexes routes by root run id in a single directory scan", () => {
-		const routeA = trackRoute("index-root-a");
-		const routeB = trackRoute("index-root-b");
+		const routeA = trackRoute(fixtureId("index-root-a"));
+		const routeB = trackRoute(fixtureId("index-root-b"));
 
 		const index = buildNestedRouteIndex();
 
-		assert.equal(index.get("index-root-a")?.capabilityToken, routeA.capabilityToken);
-		assert.equal(index.get("index-root-b")?.capabilityToken, routeB.capabilityToken);
+		assert.equal(index.get(fixtureId("index-root-a"))?.capabilityToken, routeA.capabilityToken);
+		assert.equal(index.get(fixtureId("index-root-b"))?.capabilityToken, routeB.capabilityToken);
 		assert.equal(index.get("missing-root"), undefined);
 	});
 
 	it("keeps at most one route when a root run id has duplicate route dirs", () => {
-		const first = trackRoute("dup-root");
-		const second = trackRoute("dup-root");
+		const first = trackRoute(fixtureId("dup-root"));
+		const second = trackRoute(fixtureId("dup-root"));
 
 		const index = buildNestedRouteIndex();
 
 		// readdir order is not guaranteed, so the contract is deduplication: exactly
 		// one route is indexed per root run id, not a specific winner.
-		const indexed = index.get("dup-root");
+		const indexed = index.get(fixtureId("dup-root"));
 		assert.ok(indexed, "expected one route for dup-root");
 		const tokens = new Set([first.capabilityToken, second.capabilityToken]);
 		assert.ok(tokens.has(indexed.capabilityToken), "indexed route must be one of the two created routes");
@@ -104,7 +105,7 @@ describe("nested event route validation", () => {
 		process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "2";
 		process.env[SUBAGENT_PARENT_DEPTH_ENV] = "3";
 		process.env[SUBAGENT_PARENT_PATH_ENV] = JSON.stringify([
-			{ runId: "root-run", stepIndex: 0, agent: "root-agent" },
+			{ runId: fixtureId("root-run"), stepIndex: 0, agent: "root-agent" },
 			{ runId: "../unsafe", stepIndex: 1, agent: "bad" },
 			{ runId: "nested-parent", stepIndex: 2, agent: "nested-agent" },
 		]);
@@ -114,7 +115,7 @@ describe("nested event route validation", () => {
 			parentStepIndex: 2,
 			depth: 3,
 			path: [
-				{ runId: "root-run", stepIndex: 0, agent: "root-agent" },
+				{ runId: fixtureId("root-run"), stepIndex: 0, agent: "root-agent" },
 				{ runId: "nested-parent", stepIndex: 2, agent: "nested-agent" },
 			],
 		});
@@ -147,21 +148,21 @@ describe("nested event parsing and projection", () => {
 		writeNestedEvent(route, {
 			type: "subagent.nested.started",
 			ts: 100,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			child: child("nested-a", "running", 100),
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
 			ts: 200,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			child: { ...child("nested-a", "running", 200), currentTool: "read" },
 		});
 		writeNestedEvent(route, {
 			type: "subagent.nested.completed",
 			ts: 300,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			child: child("nested-a", "complete", 300),
 		});
@@ -173,7 +174,7 @@ describe("nested event parsing and projection", () => {
 		assert.equal(registry.children[0]?.steps?.[0]?.agent, "leaf");
 
 		const job: AsyncJobState = {
-			asyncId: "root-run",
+			asyncId: fixtureId("root-run"),
 			asyncDir: "/tmp/root-run",
 			status: "running",
 			nestedRoute: route,
@@ -187,7 +188,7 @@ describe("nested event parsing and projection", () => {
 		assert.equal(job.steps?.[1]?.children?.[0]?.id, "nested-a");
 
 		const control: SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never = {
-			runId: "root-run",
+			runId: fixtureId("root-run"),
 			mode: "single",
 			startedAt: 1,
 			updatedAt: 1,
@@ -202,12 +203,12 @@ describe("nested event parsing and projection", () => {
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
 			ts: 100,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 3,
-			child: { ...child("nested-visible", "running", 100), parentStepIndex: 3, path: [{ runId: "root-run", stepIndex: 3 }] },
+			child: { ...child("nested-visible", "running", 100), parentStepIndex: 3, path: [{ runId: fixtureId("root-run"), stepIndex: 3 }] },
 		});
 		const job: AsyncJobState = {
-			asyncId: "root-run",
+			asyncId: fixtureId("root-run"),
 			asyncDir: "/tmp/root-run",
 			status: "running",
 			nestedRoute: route,
@@ -232,7 +233,7 @@ describe("nested event parsing and projection", () => {
 				type: "subagent.nested.started",
 				ts: 50,
 				rootRunId: route.rootRunId,
-				parentRunId: "root-run",
+				parentRunId: fixtureId("root-run"),
 				parentStepIndex: 1,
 				capabilityToken: route.capabilityToken,
 				child: child("partial-good", "running", 50),
@@ -242,7 +243,7 @@ describe("nested event parsing and projection", () => {
 		writeNestedEvent(route, {
 			type: "subagent.nested.completed",
 			ts: 300,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			child: child("nested-terminal", "complete", 300),
 		});
@@ -250,7 +251,7 @@ describe("nested event parsing and projection", () => {
 			type: "subagent.nested.updated",
 			ts: 400,
 			rootRunId: route.rootRunId,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			capabilityToken: route.capabilityToken,
 			child: child("nested-terminal", "running", 100),
@@ -259,7 +260,7 @@ describe("nested event parsing and projection", () => {
 			type: "subagent.nested.started",
 			ts: 500,
 			rootRunId: route.rootRunId,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			capabilityToken: "wrong",
 			child: child("wrong-token", "running", 500),
@@ -292,7 +293,7 @@ describe("nested event parsing and projection", () => {
 		writeNestedEvent(route, {
 			type: "subagent.nested.updated",
 			ts: 100,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			child: { ...child("nested-valid-tokens", "running", 100), totalTokens: { input: 10, output: 15, total: 25 } },
 		});
@@ -300,7 +301,7 @@ describe("nested event parsing and projection", () => {
 			type: "subagent.nested.updated",
 			ts: 200,
 			rootRunId: route.rootRunId,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			capabilityToken: route.capabilityToken,
 			child: { ...child("nested-invalid-tokens", "running", 200), totalTokens: { input: 1, output: "bad", total: 1 } },
@@ -318,7 +319,7 @@ describe("nested event parsing and projection", () => {
 			type: "subagent.nested.started",
 			ts: 100,
 			rootRunId: route.rootRunId,
-			parentRunId: "root-run",
+			parentRunId: fixtureId("root-run"),
 			parentStepIndex: 1,
 			capabilityToken: route.capabilityToken,
 			child: child("jsonl-good", "running", 100),

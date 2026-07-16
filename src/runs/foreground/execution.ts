@@ -4,6 +4,7 @@
 
 import { spawn } from "node:child_process";
 import { existsSync, unlinkSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import type { AgentConfig } from "../../agents/agents.ts";
 import {
@@ -72,6 +73,8 @@ import {
 import { acceptanceFailureMessage, evaluateAcceptance, formatAcceptancePrompt, resolveEffectiveAcceptance, stripAcceptanceReport } from "../shared/acceptance.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, shouldAbortForTurnBudget, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
+import { childTarget } from "../shared/child-identity.ts";
+import { activeChildControllers } from "./active-child-controllers.ts";
 
 const artifactOutputByResult = new WeakMap<SingleResult, string>();
 const acceptanceOutputByResult = new WeakMap<SingleResult, string>();
@@ -219,11 +222,15 @@ async function runSingleAttempt(
 		parentSessionId: options.parentSessionId,
 		structuredOutput: options.structuredOutput,
 		toolBudget: options.toolBudget,
+		steerInboxDir: options.steerInboxDir,
 	});
 
 	const result: SingleResult = {
 		agent: agent.name,
 		task: shared.originalTask ?? task,
+		cwd: resolvePath(options.cwd ?? runtimeCwd),
+		...(options.runId ? { childTarget: childTarget(options.runId, options.index ?? 0) } : {}),
+		...(options.handle ? { handle: options.handle } : {}),
 		exitCode: 0,
 		messages: [],
 		usage: emptyUsage(),
@@ -298,6 +305,9 @@ async function runSingleAttempt(
 			detached: foregroundSpawnDetached(),
 		});
 		const jsonlWriter = createJsonlWriter(shared.jsonlPath, proc.stdout);
+		const unregisterActiveController = options.steerInboxDir && options.runId
+			? activeChildControllers.register(childTarget(options.runId, options.index ?? 0), options.steerInboxDir, proc.pid ?? process.pid)
+			: undefined;
 		let buf = "";
 		let processClosed = false;
 		let settled = false;
@@ -413,6 +423,7 @@ async function runSingleAttempt(
 				activityTimer = undefined;
 			}
 			unsubscribeIntercomDetach?.();
+			unregisterActiveController?.();
 			setBackgroundSupervisorPending(false);
 			removeAbortListener?.();
 			removeInterruptListener?.();

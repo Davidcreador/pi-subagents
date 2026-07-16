@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import { ASYNC_DIR, INTERCOM_DETACH_REQUEST_EVENT, RESULTS_DIR, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
+import { interruptRequestPath } from "../../src/runs/background/control-channel.ts";
 import type { MockPi } from "../support/helpers.ts";
 import {
 	createMockPi,
@@ -354,10 +355,8 @@ describe("intercom result delivery cutover", { skip: !available ? "executor not 
 
 			assert.equal(result.isError, undefined);
 			assert.match(result.content[0]?.text ?? "", /Interrupted live async child, then delivered follow-up/);
-			assert.deepEqual(kills, [
-				{ pid: process.pid, signal: 0 },
-				{ pid: process.pid, signal: process.platform === "win32" ? "SIGBREAK" : "SIGUSR2" },
-			]);
+			assert.deepEqual(kills, [{ pid: process.pid, signal: 0 }]);
+			assert.equal(JSON.parse(fs.readFileSync(interruptRequestPath(asyncDir), "utf-8")).type, "interrupt");
 			const payload = events.emitted.find((entry) => entry.channel === "subagent:result-intercom")?.payload as { to?: string; message?: string } | undefined;
 			assert.equal(payload?.to, `subagent-worker-${runId}-1`);
 			assert.match(payload?.message ?? "", /Can you clarify the last change\?/);

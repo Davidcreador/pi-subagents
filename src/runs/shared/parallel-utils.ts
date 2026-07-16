@@ -3,6 +3,8 @@ export interface RunnerSubagentStep {
 	parentSessionId?: string;
 	agent: string;
 	task: string;
+	childTarget?: string;
+	handle?: string;
 	importAsyncRoot?: {
 		runId: string;
 		asyncDir: string;
@@ -52,6 +54,8 @@ export interface DynamicRunnerGroup {
 	expand: import("../../shared/settings.ts").DynamicExpandSpec;
 	parallel: RunnerSubagentStep;
 	collect: import("../../shared/settings.ts").DynamicCollectSpec;
+	startIndex?: number;
+	reservedItems?: number;
 	concurrency?: number;
 	failFast?: boolean;
 	phase?: string;

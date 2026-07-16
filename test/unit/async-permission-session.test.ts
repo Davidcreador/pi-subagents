@@ -67,9 +67,12 @@ describe("async permission forwarding session identity", () => {
 		assert.ok(dynamic && "expand" in dynamic && "collect" in dynamic);
 		assert.deepEqual(dynamic.sessionFiles, ["/tmp/dynamic-0.jsonl", "/tmp/dynamic-1.jsonl"]);
 		assert.deepEqual(dynamic.thinkingOverrides, ["off", "off"]);
+		assert.equal(dynamic.startIndex, 1);
+		assert.equal(dynamic.reservedItems, 2);
 		const staticWorker = built.steps[2];
 		assert.ok(staticWorker && !("parallel" in staticWorker));
 		assert.equal(staticWorker.sessionFile, "/tmp/static-worker.jsonl");
+		assert.equal(staticWorker.childTarget, "run-abc:3");
 		assert.equal(staticWorker.model, "anthropic/claude-sonnet-4-5:off");
 		assert.equal(staticWorker.thinking, "off");
 	});

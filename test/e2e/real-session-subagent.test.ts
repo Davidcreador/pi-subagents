@@ -15,6 +15,7 @@ import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import * as os from "node:os";
 import * as path from "node:path";
+import { ChildThreadRegistry, childThreadRegistryPath } from "../../src/runs/shared/child-thread-registry.ts";
 import { tryImport } from "../support/helpers.ts";
 import type { RealSessionRun } from "../support/real-session-runner.ts";
 
@@ -29,6 +30,17 @@ const CHILD_MARKER = "CHILD_REAL_SESSION_OK";
 const BOGUS_EXTRA_DIRS = path.join(os.tmpdir(), "nonexistent-pi-subagents-e2e-extra-dirs");
 const BOGUS_PI_BINARY = path.join(os.tmpdir(), "nonexistent-pi-binary-e2e");
 const BOGUS_PI_PACKAGE_ROOT = path.join(os.tmpdir(), "nonexistent-pi-coding-agent-package-root-e2e");
+function latestToolResultText(messages: Array<{ role?: string; toolName?: string; content?: unknown }>, toolName: string): string | undefined {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index]!;
+		if (message.role !== "toolResult" || message.toolName !== toolName || !Array.isArray(message.content)) continue;
+		return message.content.flatMap((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "text"
+			? [String((part as { text?: unknown }).text ?? "")]
+			: []).join("");
+	}
+	return undefined;
+}
+
 const ISOLATED_ENV_KEYS = [
 	"PI_SUBAGENT_CHILD",
 	"PI_SUBAGENT_FANOUT_CHILD",
@@ -90,5 +102,50 @@ describe("real Pi-session subagent E2E", { skip: !available ? "pi runtime packag
 				else process.env[key] = value;
 			}
 		}
+	});
+
+	it("continues a settled named child through its exact persisted session", async () => {
+		const { runRealSubagentSession, subagentCall } = await import("../support/real-session-runner.ts");
+		const { SessionManager } = await import("@earendil-works/pi-coding-agent");
+		const initialMarker = "CHILD_INITIAL_TURN_OK";
+		const continuationMarker = "CHILD_CONTINUATION_TURN_OK";
+
+		run = await runRealSubagentSession({
+			prompt: "Launch the named child, continue it, wait for completion, then report success.",
+			childText: initialMarker,
+			continuationText: continuationMarker,
+			timeoutMs: 60_000,
+			respond: (context) => {
+				const messages = context.messages as Array<{ role?: string; toolName?: string; content?: unknown }>;
+				if (latestToolResultText(messages, "wait") !== undefined) return "CONTINUATION_WAITED";
+				if (latestToolResultText(messages, "send_message") !== undefined) {
+					return { type: "toolCall", id: "call-wait-e2e", name: "wait", arguments: { all: true } };
+				}
+				if (latestToolResultText(messages, "subagent") !== undefined) {
+					return { type: "toolCall", id: "call-send-message-e2e", name: "send_message", arguments: { target: "thread", message: "Return the continuation marker." } };
+				}
+				return subagentCall({
+					agent: "worker",
+					handle: "thread",
+					task: "Return the initial marker from the faux child provider.",
+					context: "fresh",
+					agentScope: "project",
+				}, "call-initial-child-e2e");
+			},
+		});
+
+		const parentSessionId = run.parentSession.sessionManager.getSessionId();
+		assert.ok(parentSessionId);
+		const record = new ChildThreadRegistry({ filePath: childThreadRegistryPath(run.agentDir) }).resolve("thread", parentSessionId);
+		assert.equal(record.handle, "thread");
+		assert.equal(record.turn, 1);
+		assert.ok(record.sessionFile);
+		const transcript = JSON.stringify(SessionManager.open(record.sessionFile).getBranch());
+		assert.match(transcript, new RegExp(initialMarker));
+		assert.match(transcript, new RegExp(continuationMarker));
+		assert.doesNotMatch(transcript, /CHILD_CONTINUATION_CONTEXT_MISSING/);
+		assert.match(latestToolResultText(run.parentSession.messages, "send_message") ?? "", /Child thread: thread=/);
+		assert.notEqual(latestToolResultText(run.parentSession.messages, "wait"), undefined);
+		assert.equal(run.responseText, "CONTINUATION_WAITED");
 	});
 });

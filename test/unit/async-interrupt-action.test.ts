@@ -91,7 +91,7 @@ function text(result: Awaited<ReturnType<ReturnType<typeof executorWithKill>["ex
 describe("async interrupt action", () => {
 	it("queues steering for a running async child", async () => {
 		const state = createState();
-		const runId = `steer-disk-${Date.now().toString(36)}`;
+		const runId = `steer-disk-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId, { track: false });
 		try {
 			const result = await executorWithKill(state, () => true)
@@ -111,7 +111,7 @@ describe("async interrupt action", () => {
 
 	it("queues steering for a running async child by directory", async () => {
 		const state = createState();
-		const runId = `steer-dir-${Date.now().toString(36)}`;
+		const runId = `steer-dir-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId, { track: false });
 		try {
 			const result = await executorWithKill(state, () => true)
@@ -129,7 +129,7 @@ describe("async interrupt action", () => {
 
 	it("queues steering for a pending indexed async child", async () => {
 		const state = createState();
-		const runId = `steer-pending-${Date.now().toString(36)}`;
+		const runId = `steer-pending-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = path.join(ASYNC_DIR, runId);
 		writeJson(path.join(asyncDir, "status.json"), {
 			runId,
@@ -158,9 +158,9 @@ describe("async interrupt action", () => {
 		}
 	});
 
-	it("interrupts a running async run resolved from disk after in-memory tracking is gone", async () => {
+	it("queues an interrupt without signaling a pid recovered from disk", async () => {
 		const state = createState();
-		const runId = `interrupt-disk-${Date.now().toString(36)}`;
+		const runId = `interrupt-disk-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId, { track: false });
 		try {
 			const kills: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = [];
@@ -172,27 +172,31 @@ describe("async interrupt action", () => {
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), new RegExp(`Interrupt requested for async run ${runId}`));
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
-			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }, { pid: 12345, signal: process.platform === "win32" ? "SIGBREAK" : "SIGUSR2" }]);
+			assert.deepEqual(kills, [{ pid: 12345, signal: 0 }]);
 		} finally {
 			cleanup(runId, asyncDir);
 		}
 	});
 
-	it("reports success and writes the portable request when the signal is unavailable", async () => {
+	it("queues an interrupt when persisted status has no pid", async () => {
 		const state = createState();
-		const runId = `interrupt-enosys-${Date.now().toString(36)}`;
+		const runId = `interrupt-enosys-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId);
+		const statusPath = path.join(asyncDir, "status.json");
+		const status = JSON.parse(fs.readFileSync(statusPath, "utf-8"));
+		delete status.pid;
+		writeJson(statusPath, status);
 		try {
-			const result = await executorWithKill(state, (_pid, signal) => {
-				if (signal === 0) return true;
-				const error = new Error("kill ENOSYS") as NodeJS.ErrnoException;
-				error.code = "ENOSYS";
-				throw error;
+			const kills: Array<{ pid: number; signal?: NodeJS.Signals | 0 }> = [];
+			const result = await executorWithKill(state, (pid, signal) => {
+				kills.push({ pid, signal });
+				return true;
 			}).execute("interrupt", { action: "interrupt", id: runId }, new AbortController().signal, undefined, ctx());
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), new RegExp(`Interrupt requested for async run ${runId}`));
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
+			assert.deepEqual(kills, []);
 		} finally {
 			cleanup(runId, asyncDir);
 		}
@@ -200,7 +204,7 @@ describe("async interrupt action", () => {
 
 	it("does not report success for stale running status with a dead pid", async () => {
 		const state = createState();
-		const runId = `interrupt-esrch-${Date.now().toString(36)}`;
+		const runId = `interrupt-esrch-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = createRunningAsync(state, runId);
 		try {
 			const result = await executorWithKill(state, () => {
@@ -210,7 +214,7 @@ describe("async interrupt action", () => {
 			}).execute("interrupt", { action: "interrupt", id: runId }, new AbortController().signal, undefined, ctx());
 
 			assert.equal(result.isError, true);
-			assert.match(text(result), /No running async run with an interrupt-capable pid/);
+			assert.match(text(result), /No running async run/);
 			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), false);
 			const status = JSON.parse(fs.readFileSync(path.join(asyncDir, "status.json"), "utf-8"));
 			assert.equal(status.state, "failed");

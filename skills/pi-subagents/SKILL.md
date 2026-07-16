@@ -2,20 +2,21 @@
 name: pi-subagents
 description: |
   Delegate work to builtin or custom subagents with single-agent, chain,
-  parallel, async, forked-context, and intercom-coordinated workflows. Use
-  for advisory review, implementation handoffs, and multi-step tasks where a
-  single agent should stay in control while other agents contribute context,
-  planning, or execution.
+  parallel, async, forked-context, and intercom-coordinated workflows. Invoke
+  proactively without waiting for explicit user syntax when non-trivial work
+  benefits from independent context, planning, implementation, or review while
+  the parent retains control.
 ---
 
 # Pi Subagents
 
 This skill is for the main parent orchestrator only. Do not inject or follow it inside spawned child subagents. The parent session owns delegation, orchestration, review fanout, and final fix-worker launches; child subagents should receive concrete role-specific tasks. Ordinary children should not run their own subagent workflows; the explicit exception is a delegated fanout child whose resolved builtin `tools` includes `subagent`, and that child may use `subagent` only for the fanout work the parent assigned.
 
-Use this skill when the parent orchestrator needs to launch a specialized subagent, compose multiple agents into a workflow, or create/edit agents and chains on demand.
+Use this skill when the parent orchestrator needs to launch a specialized subagent, compose multiple agents into a workflow, or create/edit agents and chains on demand. Decide without waiting for explicit user syntax: delegate non-trivial work when independent investigation, specialist judgment, or fresh review would materially improve the result; keep trivial or mechanical work in the parent session.
 
 ## When to Use
 
+- **Selective proactive delegation**: prefer one focused child for material independent value; use small read-only fanout only for genuinely independent workstreams, and never create concurrent writers in one cwd/worktree
 - **Advisory review**: use fresh-context `reviewer` agents for adversarial code review, or fork to `oracle` when inherited decisions and drift matter
 - **Implementation handoff**: have `oracle` advise, then `worker` implement only after an approved direction
 - **Recon and planning**: use `scout` or `context-builder`, then `planner`
@@ -34,7 +35,12 @@ Humans often use the slash-command layer instead:
 - `/chain` — launch a chain of steps
 - `/parallel` — launch top-level parallel tasks
 - `/run-chain` — launch a saved `.chain.md` or `.chain.json` workflow
+- `/agents` — browse current-session child threads and live transcripts; `Tab` toggles read-only all-session history
 - `/subagents-doctor` — diagnose setup, discovery, async paths, and intercom bridge state
+
+Every launched child receives a canonical `<runId>:<flatIndex>` target. Optional `handle` fields on single, parallel, and chain children provide parent-session-local aliases; counted children receive `-1`, `-2`, and so on. Use canonical targets when addressing a thread across parent sessions.
+
+Use `send_message({ target, message })` for one exact child thread. An active child receives isolated steering. A settled child continues its validated persisted session as a new async turn with the same cwd and stable original target. It fails rather than claiming continuity from fresh context. Prefer `send_message` over generic `resume` when the intent is an ongoing named conversation.
 
 Prefer the tool when you are writing agent logic. Prefer the slash commands when
 you are guiding a human through an interactive flow.
@@ -243,7 +249,7 @@ If a provider rejects model IDs with thinking suffixes, use
 builtin thinking defaults globally. A higher-precedence per-agent `thinking`
 override can opt one builtin back in.
 
-Tool description modes live in `~/.pi/agent/extensions/subagent/config.json`, not `subagents` settings. Set `toolDescriptionMode` to `compact` to reduce tool-description prompt cost while keeping the execution, async/wait, child-safety, one-writer, management/action, and artifact/status guardrails. Set it to `custom` to read `subagent-tool-description.md` from the project config dir or agent dir; invalid custom files fall back to full mode and the safety guidance is still appended.
+Tool description modes live in `~/.pi/agent/extensions/subagent/config.json`, not `subagents` settings. Set `toolDescriptionMode` to `compact` to reduce tool-description prompt cost while keeping selective proactive-delegation, execution, async/wait, child-safety, one-writer, management/action, and artifact/status guidance. Set it to `custom` to read `subagent-tool-description.md` from the project config dir or agent dir; invalid custom files fall back to full mode and the safety guidance is still appended.
 
 ## Discovery and Scope Rules
 

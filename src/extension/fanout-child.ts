@@ -12,6 +12,7 @@ import { resolveSubagentIntercomTarget } from "../intercom/intercom-bridge.ts";
 import { SubagentParams } from "./schemas.ts";
 import { loadConfig } from "./config.ts";
 import { type Details, type SubagentState } from "../shared/types.ts";
+import { ChildThreadRegistry } from "../runs/shared/child-thread-registry.ts";
 
 function getSubagentSessionRoot(parentSessionFile: string | null): string {
 	if (parentSessionFile) {
@@ -143,6 +144,7 @@ export default function registerFanoutChildSubagentExtension(pi: ExtensionAPI): 
 	const state = createChildSafeState();
 	const executor = createSubagentExecutor({
 		pi,
+		childThreadRegistry: new ChildThreadRegistry(),
 		state,
 		config,
 		asyncByDefault: config.asyncByDefault === true,

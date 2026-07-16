@@ -16,9 +16,10 @@ import {
 	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
 	SUBAGENT_PARENT_RUN_ID_ENV,
 } from "../../src/runs/shared/pi-args.ts";
-import { ASYNC_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { ASYNC_DIR, TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 
 const routeRoots: string[] = [];
+const fixtureId = (id: string): string => `${id}-${process.pid}`;
 const savedEnv = {
 	[SUBAGENT_CHILD_ENV]: process.env[SUBAGENT_CHILD_ENV],
 	[SUBAGENT_FANOUT_CHILD_ENV]: process.env[SUBAGENT_FANOUT_CHILD_ENV],
@@ -37,6 +38,11 @@ afterEach(() => {
 		else process.env[key] = value;
 	}
 });
+
+function writeJson(filePath: string, value: object): void {
+	fs.mkdirSync(path.dirname(filePath), { recursive: true });
+	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
+}
 
 function createState(): SubagentState {
 	return {
@@ -57,7 +63,7 @@ function createState(): SubagentState {
 	};
 }
 
-function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }) {
+function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }, kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean) {
 	return createSubagentExecutor({
 		pi: { events, getSessionName() { return "parent"; } } as any,
 		state,
@@ -68,6 +74,7 @@ function createExecutor(state = createState(), agents: Array<Record<string, unkn
 		expandTilde: (value) => value,
 		discoverAgents: () => ({ agents: agents as any }),
 		allowMutatingManagementActions,
+		kill,
 	});
 }
 
@@ -81,14 +88,14 @@ function ctx(root: string, sessionFile: string | null = null) {
 }
 
 function createNestedRun(id = "nested-live", state: "running" | "complete" | "failed" | "paused" = "running", extras: Record<string, unknown> = {}) {
-	const route = createNestedRoute("root-control");
+	const route = createNestedRoute(fixtureId("root-control"));
 	routeRoots.push(path.dirname(route.eventSink));
 	writeNestedEvent(route, {
 		type: state === "running" ? "subagent.nested.updated" : "subagent.nested.completed",
 		ts: 100,
-		parentRunId: "root-control",
+		parentRunId: fixtureId("root-control"),
 		parentStepIndex: 0,
-		child: { id, parentRunId: "root-control", parentStepIndex: 0, depth: 1, path: [{ runId: "root-control", stepIndex: 0 }], state, agent: "worker", ownerState: state === "running" ? "live" : "gone", ...extras },
+		child: { id, parentRunId: fixtureId("root-control"), parentStepIndex: 0, depth: 1, path: [{ runId: fixtureId("root-control"), stepIndex: 0 }], state, agent: "worker", ownerState: state === "running" ? "live" : "gone", ...extras },
 	});
 	return route;
 }
@@ -153,8 +160,8 @@ describe("nested control routing", () => {
 		try {
 			const route = createNestedRun("nested-foreground");
 			const state = createState();
-			state.foregroundControls.set("root-control", {
-				runId: "root-control",
+			state.foregroundControls.set(fixtureId("root-control"), {
+				runId: fixtureId("root-control"),
 				mode: "single",
 				startedAt: 1,
 				updatedAt: 1,
@@ -162,12 +169,12 @@ describe("nested control routing", () => {
 				currentIndex: 0,
 				nestedRoute: route,
 			});
-			state.lastForegroundControlId = "root-control";
+			state.lastForegroundControlId = fixtureId("root-control");
 
-			const result = await createExecutor(state).execute("status", { action: "status", id: "root-control" }, new AbortController().signal, undefined, ctx(root));
+			const result = await createExecutor(state).execute("status", { action: "status", id: fixtureId("root-control") }, new AbortController().signal, undefined, ctx(root));
 
 			assert.equal(result.isError, undefined);
-			assert.match(text(result), /Run: root-control/);
+			assert.match(text(result), new RegExp(`Run: ${fixtureId("root-control")}`));
 			assert.match(text(result), /↳ worker \[nested-foreground\] running/);
 			assert.match(text(result), /Status: subagent\(\{ action: "status", id: "nested-foreground" \}\)/);
 		} finally {
@@ -179,22 +186,22 @@ describe("nested control routing", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-child-scope-"));
 		try {
 			const allowedRoute = createNestedRun("shared-nested");
-			setNestedRouteEnv(allowedRoute, "root-control");
-			const outsideRoute = createNestedRoute("root-outside");
+			setNestedRouteEnv(allowedRoute, fixtureId("root-control"));
+			const outsideRoute = createNestedRoute(fixtureId("root-outside"));
 			routeRoots.push(path.dirname(outsideRoute.eventSink));
 			writeNestedEvent(outsideRoute, {
 				type: "subagent.nested.updated",
 				ts: 100,
-				parentRunId: "root-outside",
+				parentRunId: fixtureId("root-outside"),
 				parentStepIndex: 0,
-				child: { id: "shared-nested", parentRunId: "root-outside", parentStepIndex: 0, depth: 1, path: [{ runId: "root-outside", stepIndex: 0 }], state: "running", agent: "outside" },
+				child: { id: "shared-nested", parentRunId: fixtureId("root-outside"), parentStepIndex: 0, depth: 1, path: [{ runId: fixtureId("root-outside"), stepIndex: 0 }], state: "running", agent: "outside" },
 			});
 
 			const result = await createExecutor(createState(), [], false).execute("status", { action: "status", id: "shared-nested" }, new AbortController().signal, undefined, ctx(root));
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), /Nested run: shared-nested/);
-			assert.match(text(result), /Root: root-control/);
+			assert.match(text(result), new RegExp(`Root: ${fixtureId("root-control")}`));
 			assert.doesNotMatch(text(result), /root-outside/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
@@ -203,7 +210,7 @@ describe("nested control routing", () => {
 
 	it("requires an id for child-safe status instead of listing unrelated top-level async runs", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-child-safe-status-"));
-		const runId = `child-safe-unrelated-${Date.now().toString(36)}`;
+		const runId = `child-safe-unrelated-${process.pid}-${Date.now().toString(36)}`;
 		const asyncDir = path.join(ASYNC_DIR, runId);
 		try {
 			fs.mkdirSync(asyncDir, { recursive: true });
@@ -255,6 +262,35 @@ describe("nested control routing", () => {
 			assert.doesNotMatch(text(result), /late success/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("queues a direct nested async interrupt without signaling a persisted pid", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-direct-interrupt-"));
+		const nestedId = fixtureId("nested-direct-interrupt");
+		const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", fixtureId("root-control"), nestedId);
+		try {
+			writeJson(path.join(asyncDir, "status.json"), {
+				runId: nestedId,
+				pid: process.pid,
+				mode: "single",
+				state: "running",
+				startedAt: 100,
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", startedAt: 100 }],
+			});
+			const route = createNestedRun(nestedId, "running", { asyncDir, pid: process.pid });
+			const signals: Array<NodeJS.Signals | 0 | undefined> = [];
+			const result = await createExecutor(stateWithNestedRoute(route), [], true, undefined, (_pid, signal) => { signals.push(signal); return true; })
+				.execute("interrupt", { action: "interrupt", id: nestedId }, new AbortController().signal, undefined, ctx(root));
+
+			assert.equal(result.isError, undefined);
+			assert.equal(signals.some((signal) => signal !== 0), false);
+			assert.match(text(result), /Interrupt requested for nested async run/);
+			assert.equal(fs.existsSync(path.join(asyncDir, "control", "interrupt.json")), true);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+			fs.rmSync(asyncDir, { recursive: true, force: true });
 		}
 	});
 
@@ -344,9 +380,9 @@ describe("nested control routing", () => {
 	it("emits a failed completed nested event when foreground execution throws after start", async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-foreground-throw-"));
 		try {
-			const route = createNestedRoute("root-parent");
+			const route = createNestedRoute(fixtureId("root-parent"));
 			routeRoots.push(path.dirname(route.eventSink));
-			setNestedRouteEnv(route, "root-parent");
+			setNestedRouteEnv(route, fixtureId("root-parent"));
 			const throwingCtx = {
 				...ctx(root),
 				modelRegistry: { getAvailable() { throw new Error("model registry exploded"); } },
@@ -367,9 +403,9 @@ describe("nested control routing", () => {
 	});
 
 	it("keeps the fanout child control listener alive after control inbox polling errors", async () => {
-		const route = createNestedRoute("root-poll-error");
+		const route = createNestedRoute(fixtureId("root-poll-error"));
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-poll-error");
+		setNestedRouteEnv(route, fixtureId("root-poll-error"));
 		process.env[SUBAGENT_CHILD_ENV] = "1";
 		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 		const pi = {
@@ -386,7 +422,7 @@ describe("nested control routing", () => {
 		};
 		try {
 			registerFanoutChildSubagentExtension(pi);
-			await waitFor(() => logged.some((entry) => String(entry[0] ?? "").includes(route.controlInbox) && String(entry[0] ?? "").includes("root-poll-error")));
+			await waitFor(() => logged.some((entry) => String(entry[0] ?? "").includes(route.controlInbox) && String(entry[0] ?? "").includes(fixtureId("root-poll-error"))));
 
 			fs.rmSync(route.controlInbox, { force: true });
 			fs.mkdirSync(route.controlInbox, { recursive: true });
@@ -405,9 +441,9 @@ describe("nested control routing", () => {
 	});
 
 	it("keeps fanout child control requests when result writing fails and retries after recovery", async () => {
-		const route = createNestedRoute("root-result-write-fails");
+		const route = createNestedRoute(fixtureId("root-result-write-fails"));
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-result-write-fails");
+		setNestedRouteEnv(route, fixtureId("root-result-write-fails"));
 		process.env[SUBAGENT_CHILD_ENV] = "1";
 		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 		const pi = {
@@ -443,9 +479,9 @@ describe("nested control routing", () => {
 	});
 
 	it("negatively acknowledges ownerless fanout child control requests and removes them", async () => {
-		const route = createNestedRoute("root-ownerless");
+		const route = createNestedRoute(fixtureId("root-ownerless"));
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-ownerless");
+		setNestedRouteEnv(route, fixtureId("root-ownerless"));
 		process.env[SUBAGENT_CHILD_ENV] = "1";
 		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
 		const pi = {

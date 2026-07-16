@@ -233,6 +233,30 @@ describe("registerSubagentNotify", () => {
 		assert.equal(sent.length, 2);
 	});
 
+	it("disposes held completion timers and the event subscription", () => {
+		const clock = createFakeClock();
+		const events = new EventEmitter();
+		const sent: unknown[] = [];
+		const stop = registerSubagentNotify({
+			events: {
+				on(event: string, handler: (data: unknown) => void) {
+					events.on(event, handler);
+					return () => events.off(event, handler);
+				},
+			},
+			sendMessage(message: unknown) { sent.push(message); },
+		} as never, { currentSessionId: "session-a" }, {
+			batchConfig: { enabled: true, debounceMs: 150, maxWaitMs: 1000, stragglerDebounceMs: 75, stragglerMaxWaitMs: 400, stragglerWindowMs: 2000 },
+			timers: clock.api,
+			now: clock.now,
+		});
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "dispose-held" }));
+		stop();
+		clock.advance(1000);
+		events.emit(SUBAGENT_ASYNC_COMPLETE_EVENT, completionResult({ id: "dispose-late" }));
+		assert.deepEqual(sent, []);
+	});
+
 	it("groups sibling successes into a single notification after the debounce window", () => {
 		const clock = createFakeClock();
 		const { events, sent } = createBatchingPi(clock);

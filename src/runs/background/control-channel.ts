@@ -56,6 +56,7 @@ export interface SteerRequest {
 
 const STEER_REQUESTS_DIR = "steer-requests";
 const STEER_TARGETS_DIR = "steer-targets";
+const STEER_REQUEST_FILE_PATTERN = /^\d+-[A-Za-z0-9_-]+\.json$/;
 
 /** Control inbox directory inside an async run dir. */
 export function controlInboxDir(asyncDir: string): string {
@@ -165,7 +166,7 @@ function parseSteerRequest(raw: unknown): SteerRequest | undefined {
 export function consumeSteerRequestsFromDir(dir: string, fsImpl: Pick<typeof fs, "existsSync" | "rmSync" | "readdirSync" | "readFileSync"> = fs): SteerRequest[] {
 	if (!fsImpl.existsSync(dir)) return [];
 	const requests: SteerRequest[] = [];
-	for (const entry of fsImpl.readdirSync(dir).filter((name) => name.endsWith(".json")).sort()) {
+	for (const entry of fsImpl.readdirSync(dir).filter((name) => STEER_REQUEST_FILE_PATTERN.test(name)).sort()) {
 		const requestPath = path.join(dir, entry);
 		let parsed: SteerRequest | undefined;
 		try {

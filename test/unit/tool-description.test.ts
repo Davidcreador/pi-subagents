@@ -28,8 +28,8 @@ function parentToolEnv(agentDir?: string): NodeJS.ProcessEnv {
 }
 
 describe("registered subagent tool description", () => {
-	it("keeps full mode safe and free of hardcoded builtin agent names", () => {
-		const description = buildSubagentToolDescription();
+	it("keeps explicit full mode safe and free of hardcoded builtin agent names", () => {
+		const description = buildSubagentToolDescription({ toolDescriptionMode: "full" });
 
 		for (const builtinName of ["scout", "worker", "planner"]) {
 			assert.doesNotMatch(description, new RegExp(`\\b${builtinName}\\b`));
@@ -39,6 +39,9 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /proactive skill subagent suggestions/i);
 		assert.doesNotMatch(description, /disabled builtins/i);
 		assert.match(description, /output\?,reads\?,progress\?/i);
+		assert.match(description, /handle\?/i);
+		assert.match(description, /childTarget runId:flatIndex/i);
+		assert.match(description, /send_message\(\{target,message\}\)/i);
 		assert.match(description, /timeoutMs/i);
 		assert.match(description, /maxRuntimeMs/i);
 		assert.match(description, /foreground and async\/background runs/i);
@@ -58,10 +61,11 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /events\.jsonl/);
 	});
 
-	it("offers a compact mode that keeps safety-critical guidance", () => {
-		const description = buildSubagentToolDescription({ toolDescriptionMode: "compact" });
+	it("defaults omitted mode to compact and keeps safety-critical guidance", () => {
+		const description = buildSubagentToolDescription();
 
 		assert.equal(description, COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(buildSubagentToolDescription({ toolDescriptionMode: "compact" }), COMPACT_SUBAGENT_TOOL_DESCRIPTION);
 		assert.ok(description.length < FULL_SUBAGENT_TOOL_DESCRIPTION.length * 0.8, "compact mode should be materially shorter than full mode");
 		assert.match(description, /SINGLE/);
 		assert.match(description, /PARALLEL/);
@@ -79,6 +83,22 @@ describe("registered subagent tool description", () => {
 		assert.match(description, /disable/);
 		assert.match(description, /status\.json/);
 		assert.match(description, /events\.jsonl/);
+	});
+
+	it("prompts selective proactive delegation in every built-in model-facing surface", () => {
+		for (const description of [FULL_SUBAGENT_TOOL_DESCRIPTION, COMPACT_SUBAGENT_TOOL_DESCRIPTION]) {
+			assert.match(description, /Decide without waiting for explicit user syntax/i);
+			assert.match(description, /materially improve correctness, coverage, or confidence/i);
+			assert.match(description, /Do not delegate trivial or mechanical work/i);
+			assert.match(description, /never create concurrent writers in the same cwd\/worktree/i);
+			assert.match(description, /agent-selection hints, not as a reason by themselves to delegate/i);
+			assert.ok(description.indexOf("PROACTIVE USE") < description.indexOf("EXECUT"));
+		}
+
+		const skill = fs.readFileSync(path.join(projectRoot, "skills", "pi-subagents", "SKILL.md"), "utf-8");
+		const frontmatterEnd = skill.indexOf("\n---", 3);
+		assert.ok(frontmatterEnd > 0);
+		assert.match(skill.slice(0, frontmatterEnd), /Invoke\s+proactively without waiting for explicit user syntax/i);
 	});
 
 	it("renders a custom project description with placeholders and mandatory safety guidance", () => {
@@ -211,9 +231,72 @@ describe("registered subagent tool description", () => {
 		fs.writeFileSync(path.join(configDir, "config.json"), JSON.stringify(config), "utf-8");
 	}
 
+	it("registers subagent, send_message, wait, and /agents from the packaged entrypoint", () => {
+		const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-main-surface-"));
+		const script = String.raw`
+			import registerSubagentExtension from "./src/extension/index.ts";
+			const tools = [];
+			const commands = [];
+			const fakePi = new Proxy({
+				events: { on() { return () => {}; }, emit() {} },
+				registerTool(tool) {
+					tools.push({
+						name: tool.name,
+						properties: Object.keys(tool.parameters?.properties ?? {}).sort(),
+						required: [...(tool.parameters?.required ?? [])].sort(),
+						constraints: Object.fromEntries(Object.entries(tool.parameters?.properties ?? {}).map(([name, schema]) => [name, { type: schema.type, minLength: schema.minLength }])),
+						additionalProperties: tool.parameters?.additionalProperties,
+					});
+				},
+				registerCommand(name) { commands.push(name); },
+				registerShortcut() {},
+				registerMessageRenderer() {},
+				sendMessage() {},
+				getSessionName() { return undefined; },
+			}, {
+				get(target, prop) {
+					if (prop in target) return target[prop];
+					return () => undefined;
+				},
+			});
+			registerSubagentExtension(fakePi);
+			process.stdout.write(JSON.stringify({ tools, commands }));
+		`;
+		const output = execFileSync(
+			process.execPath,
+			[
+				"--experimental-transform-types",
+				"--import",
+				"./test/support/register-loader.mjs",
+				"--input-type=module",
+				"--eval",
+				script,
+			],
+			{ cwd: projectRoot, env: parentToolEnv(agentDir), encoding: "utf-8" },
+		);
+		const surface = JSON.parse(output) as { tools: Array<{ name: string; properties: string[]; required: string[]; constraints: Record<string, { type?: string; minLength?: number }>; additionalProperties?: boolean }>; commands: string[] };
+		const toolNames = surface.tools.map((tool) => tool.name);
+		assert.ok(toolNames.includes("subagent"));
+		assert.ok(toolNames.includes("send_message"));
+		assert.ok(toolNames.includes("wait"));
+		assert.ok(surface.commands.includes("agents"));
+		const sendMessage = surface.tools.find((tool) => tool.name === "send_message");
+		assert.deepEqual(sendMessage?.properties, ["message", "target"]);
+		assert.deepEqual(sendMessage?.required, ["message", "target"]);
+		assert.deepEqual(sendMessage?.constraints, {
+			target: { type: "string", minLength: 1 },
+			message: { type: "string", minLength: 1 },
+		});
+		assert.equal(sendMessage?.additionalProperties, false);
+	});
+
 	it("registers full, compact, custom, and fallback descriptions from extension config", () => {
 		const defaultAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-default-"));
-		assert.equal(readRegisteredDescription(defaultAgentDir), FULL_SUBAGENT_TOOL_DESCRIPTION);
+		assert.equal(readRegisteredDescription(defaultAgentDir), COMPACT_SUBAGENT_TOOL_DESCRIPTION);
+
+		const fullAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-full-"));
+		writeExtensionConfig(fullAgentDir, { toolDescriptionMode: "full" });
+		assert.equal(readRegisteredDescription(fullAgentDir), FULL_SUBAGENT_TOOL_DESCRIPTION);
 
 		const compactAgentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-tool-desc-compact-"));
 		writeExtensionConfig(compactAgentDir, { toolDescriptionMode: "compact" });

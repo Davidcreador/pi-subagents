@@ -26,6 +26,10 @@ import {
 	tryImport,
 } from "../support/helpers.ts";
 import { INTERCOM_DETACH_REQUEST_EVENT, INTERCOM_DETACH_RESPONSE_EVENT } from "../../src/shared/types.ts";
+import { sendMessageToChild } from "../../src/extension/send-message.ts";
+import { activeChildControllers, foregroundSteerInboxDir } from "../../src/runs/foreground/active-child-controllers.ts";
+import { consumeSteerRequestsFromDir } from "../../src/runs/background/control-channel.ts";
+import { ChildThreadRegistry, type ChildThreadRecord } from "../../src/runs/shared/child-thread-registry.ts";
 import {
 	SUBAGENT_FANOUT_CHILD_ENV,
 	SUBAGENT_PARENT_CHILD_INDEX_ENV,
@@ -218,9 +222,10 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		return readCall().args;
 	}
 
-	function makeExecutor(agents = [makeAgent("echo")], config: Record<string, unknown> = {}) {
+	function makeExecutor(agents = [makeAgent("echo")], config: Record<string, unknown> = {}, childThreadRegistry?: ChildThreadRegistry) {
 		return createSubagentExecutor!({
 			pi: { events: createEventBus(), getSessionName: () => undefined },
+			childThreadRegistry,
 			state: { baseCwd: tempDir, currentSessionId: null, asyncJobs: new Map(), foregroundControls: new Map(), lastForegroundControlId: null },
 			config,
 			asyncByDefault: false,
@@ -229,6 +234,27 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 			expandTilde: (value: string) => value,
 			discoverAgents: () => ({ agents }),
 		});
+	}
+
+	async function waitForActiveThread(registry: ChildThreadRegistry, handle: string, timeoutMs = 5_000): Promise<ChildThreadRecord> {
+		const deadline = Date.now() + timeoutMs;
+		while (Date.now() < deadline) {
+			const record = registry.list("session-123").find((candidate) => candidate.handle === handle);
+			if (record && activeChildControllers.get(`${record.latestRunId}:${record.latestIndex}`)) return record;
+			await new Promise((resolve) => setTimeout(resolve, 10));
+		}
+		throw new Error(`Timed out waiting for active child '${handle}'.`);
+	}
+
+	function messageState() {
+		return {
+			baseCwd: tempDir,
+			currentSessionId: "session-123",
+			asyncJobs: new Map(),
+			foregroundRuns: new Map(),
+			foregroundControls: new Map(),
+			lastForegroundControlId: null,
+		};
 	}
 
 	it("spawns agent and captures output", async () => {
@@ -261,6 +287,105 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 
 		assert.equal(result.isError, undefined);
 		assert.match(result.content[0]?.text ?? "", /single alias finished/);
+	});
+
+	it("projects canonical child targets and handles through foreground execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "identified child finished" });
+		const executor = makeExecutor([makeAgent("echo")]);
+
+		const result = await executor.execute(
+			"identity",
+			{ agent: "echo", task: "Run identified child", handle: "worker-one" },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		assert.match(result.details.results[0]?.childTarget ?? "", /^[A-Za-z0-9._-]+:0$/);
+		assert.equal(result.details.results[0]?.handle, "worker-one");
+		assert.equal(result.details.childTargets?.[0]?.childTarget, result.details.results[0]?.childTarget);
+		assert.match(result.content.at(-1)?.text ?? "", /worker-one=/);
+	});
+
+	it("projects and steers stable identities through top-level parallel execution", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "parallel left done", delay: 1500 });
+		mockPi.onCall({ output: "parallel right done", delay: 1500 });
+		const registry = new ChildThreadRegistry({ filePath: path.join(tempDir, "parallel-registry.json") });
+		const executor = makeExecutor([makeAgent("echo")], {}, registry);
+		const ctx = makeMinimalCtx(tempDir);
+		const pending = executor.execute(
+			"parallel-identities",
+			{
+				tasks: [
+					{ agent: "echo", task: "Parallel left", handle: "parallel-left" },
+					{ agent: "echo", task: "Parallel right", handle: "parallel-right" },
+				],
+				concurrency: 2,
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		const active = await waitForActiveThread(registry, "parallel-right");
+		const latestTarget = `${active.latestRunId}:${active.latestIndex}`;
+		const steering = await sendMessageToChild({ target: active.originalTarget, message: "Check the right branch." }, ctx as never, {
+			registry,
+			state: messageState() as never,
+			continueStoredChild: async () => { throw new Error("must not continue an active child"); },
+			trustedSessionRoots: () => [tempDir],
+		});
+		assert.equal(steering.isError, undefined);
+		assert.match(steering.content[0]?.text ?? "", /Message queued for active foreground child/);
+		assert.deepEqual(consumeSteerRequestsFromDir(foregroundSteerInboxDir(active.latestRunId, active.latestIndex)).map((request) => request.message), ["Check the right branch."]);
+
+		const result = await pending;
+		const runId = result.details.runId;
+		assert.ok(runId);
+		assert.deepEqual(result.details.results.map((child: { childTarget?: string }) => child.childTarget), [`${runId}:0`, `${runId}:1`]);
+		assert.deepEqual(result.details.results.map((child: { handle?: string }) => child.handle), ["parallel-left", "parallel-right"]);
+		assert.equal(registry.resolve("parallel-left", "session-123").originalTarget, `${runId}:0`);
+		assert.equal(registry.resolve("parallel-right", "session-123").originalTarget, `${runId}:1`);
+	});
+
+	it("projects and steers stable identities through a static chain", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
+		mockPi.onCall({ output: "plan done" });
+		mockPi.onCall({ output: "review done", delay: 1500 });
+		const registry = new ChildThreadRegistry({ filePath: path.join(tempDir, "chain-registry.json") });
+		const executor = makeExecutor([makeAgent("echo")], {}, registry);
+		const ctx = makeMinimalCtx(tempDir);
+		const pending = executor.execute(
+			"chain-identities",
+			{
+				chain: [
+					{ agent: "echo", task: "Draft the plan", handle: "chain-planner" },
+					{ agent: "echo", task: "Review {previous}", handle: "chain-reviewer" },
+				],
+			},
+			new AbortController().signal,
+			undefined,
+			ctx,
+		);
+
+		const active = await waitForActiveThread(registry, "chain-reviewer");
+		const steering = await sendMessageToChild({ target: active.originalTarget, message: "Challenge the final assumption." }, ctx as never, {
+			registry,
+			state: messageState() as never,
+			continueStoredChild: async () => { throw new Error("must not continue an active child"); },
+			trustedSessionRoots: () => [tempDir],
+		});
+		assert.equal(steering.isError, undefined);
+		assert.match(steering.content[0]?.text ?? "", /Message queued for active foreground child/);
+		assert.deepEqual(consumeSteerRequestsFromDir(foregroundSteerInboxDir(active.latestRunId, active.latestIndex)).map((request) => request.message), ["Challenge the final assumption."]);
+
+		const result = await pending;
+		const runId = result.details.runId;
+		assert.ok(runId);
+		assert.deepEqual(result.details.results.map((child: { childTarget?: string }) => child.childTarget), [`${runId}:0`, `${runId}:1`]);
+		assert.deepEqual(result.details.results.map((child: { handle?: string }) => child.handle), ["chain-planner", "chain-reviewer"]);
+		assert.equal(registry.resolve("chain-planner", "session-123").originalTarget, `${runId}:0`);
+		assert.equal(registry.resolve("chain-reviewer", "session-123").originalTarget, `${runId}:1`);
 	});
 
 	it("rejects unknown action strings at runtime", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {
@@ -339,6 +464,29 @@ describe("single sync execution", { skip: !available ? "pi packages not availabl
 		assert.equal(result.isError, undefined);
 		assert.equal(mockPi.callCount(), 2);
 		assert.deepEqual(result.details?.totalCost, { inputTokens: 200, outputTokens: 100, costUsd: 0.002 });
+	});
+
+	it("preserves each top-level parallel task cwd in child-thread metadata", async () => {
+		mockPi.onCall({ output: "first cwd result" });
+		mockPi.onCall({ output: "second cwd result" });
+		const firstCwd = path.join(tempDir, "first-cwd");
+		const secondCwd = path.join(tempDir, "second-cwd");
+		fs.mkdirSync(firstCwd);
+		fs.mkdirSync(secondCwd);
+		const registry = new ChildThreadRegistry({ filePath: path.join(tempDir, "child-registry.json") });
+		const executor = makeExecutor([makeAgent("echo"), makeAgent("second")], {}, registry);
+
+		const result = await executor.execute(
+			"parallel-cwd",
+			{ tasks: [{ agent: "echo", task: "First task", cwd: firstCwd }, { agent: "second", task: "Second task", cwd: secondCwd }] },
+			new AbortController().signal,
+			undefined,
+			makeMinimalCtx(tempDir),
+		);
+
+		assert.equal(result.isError, undefined);
+		const records = registry.list().sort((left, right) => left.latestIndex - right.latestIndex);
+		assert.deepEqual(records.map((record) => record.cwd), [firstCwd, secondCwd]);
 	});
 
 	it("reports total cost for foreground single runs", { skip: !createSubagentExecutor ? "executor not importable" : undefined }, async () => {

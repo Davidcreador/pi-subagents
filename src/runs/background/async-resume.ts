@@ -5,8 +5,6 @@ import { resolveSubagentIntercomTarget } from "../../intercom/intercom-bridge.ts
 import { deliverInterruptRequest } from "./control-channel.ts";
 import { reconcileAsyncRun } from "./stale-run-reconciler.ts";
 
-export const ASYNC_RESUME_INTERRUPT_SIGNAL: NodeJS.Signals = process.platform === "win32" ? "SIGBREAK" : "SIGUSR2";
-
 export interface AsyncResumeParams {
 	id?: string;
 	runId?: string;
@@ -51,15 +49,12 @@ export function interruptLiveAsyncResumeTarget(input: {
 		return { ok: false, message: `Async run ${asyncId} is live but does not have an async directory to interrupt.` };
 	}
 	const status = reconcileAsyncRun(input.target.asyncDir, { resultsDir: input.resultsDir, kill: input.kill, now: input.now }).status;
-	if (!status || status.state !== "running" || typeof status.pid !== "number") {
-		return { ok: false, message: `Async run ${asyncId} is live but no interrupt-capable runner pid was found.` };
+	if (!status || status.state !== "running") {
+		return { ok: false, message: `Async run ${asyncId} is not running.` };
 	}
 	try {
 		deliverInterruptRequest({
 			asyncDir: input.target.asyncDir,
-			pid: status.pid,
-			kill: input.kill,
-			signal: ASYNC_RESUME_INTERRUPT_SIGNAL,
 			now: input.now,
 			source: "async-resume",
 		});
@@ -84,7 +79,7 @@ interface AsyncResultFile {
 	success?: boolean;
 	cwd?: string;
 	sessionFile?: string;
-	results?: Array<{ agent?: string; success?: boolean; sessionFile?: string; intercomTarget?: string }>;
+	results?: Array<{ agent?: string; childTarget?: string; handle?: string; success?: boolean; sessionFile?: string; intercomTarget?: string }>;
 }
 
 export interface AsyncRunLocation {
@@ -120,11 +115,13 @@ function validateResultFile(value: unknown, resultPath: string): AsyncResultFile
 		results = resultsValue.map((entry, index) => {
 			const child = ensureObject(entry, `${resultPath} results[${index}]`);
 			const agent = validateOptionalString(child, "agent", resultPath, `results[${index}].agent`);
+			const childTarget = validateOptionalString(child, "childTarget", resultPath, `results[${index}].childTarget`);
+			const handle = validateOptionalString(child, "handle", resultPath, `results[${index}].handle`);
 			const sessionFile = validateOptionalString(child, "sessionFile", resultPath, `results[${index}].sessionFile`);
 			const intercomTarget = validateOptionalString(child, "intercomTarget", resultPath, `results[${index}].intercomTarget`);
 			const success = child.success;
 			if (success !== undefined && typeof success !== "boolean") throw new Error(`Invalid async result file '${resultPath}': results[${index}].success must be a boolean.`);
-			return { agent, sessionFile, intercomTarget, ...(typeof success === "boolean" ? { success } : {}) };
+			return { agent, childTarget, handle, sessionFile, intercomTarget, ...(typeof success === "boolean" ? { success } : {}) };
 		});
 	}
 	const success = data.success;
@@ -258,6 +255,12 @@ function resultState(result: AsyncResultFile): AsyncStatus["state"] {
 	return result.success ? "complete" : "failed";
 }
 
+function validateStoredChildCwd(runId: string, index: number, cwd: string | undefined): string | undefined {
+	if (!cwd) return undefined;
+	if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) throw new Error(`Async run '${runId}' child ${index} cwd no longer exists: ${cwd}`);
+	return cwd;
+}
+
 function validateStatusForResume(status: AsyncStatus | null, source: string): void {
 	if (!status) return;
 	if (typeof status.runId !== "string") throw new Error(`Invalid async status '${source}': runId must be a string.`);
@@ -320,7 +323,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 					agent: selectedStep.agent,
 					index: requestedIndex,
 					intercomTarget: resolveSubagentIntercomTarget(runId, selectedStep.agent, requestedIndex),
-					cwd: status?.cwd ?? result?.cwd,
+					cwd: validateStoredChildCwd(runId, requestedIndex, selectedStep.cwd ?? status?.cwd ?? result?.cwd),
 					sessionFile: selectedStep.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
 				};
 			}
@@ -342,7 +345,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 				agent: selected.step.agent,
 				index: selected.index,
 				intercomTarget: resolveSubagentIntercomTarget(runId, selected.step.agent, selected.index),
-				cwd: status?.cwd ?? result?.cwd,
+				cwd: validateStoredChildCwd(runId, selected.index, selected.step.cwd ?? status?.cwd ?? result?.cwd),
 				sessionFile: selected.step.sessionFile ?? status?.sessionFile ?? result?.sessionFile,
 			};
 		}
@@ -370,7 +373,7 @@ export function resolveAsyncResumeTarget(params: AsyncResumeParams, deps: AsyncR
 		agent,
 		index,
 		intercomTarget: resolveSubagentIntercomTarget(runId, agent, index),
-		cwd: status?.cwd ?? result?.cwd,
+		cwd: validateStoredChildCwd(runId, index, statusSteps[index]?.cwd ?? status?.cwd ?? result?.cwd),
 		...(resolvedSessionFile ? { sessionFile: resolvedSessionFile } : {}),
 	};
 }

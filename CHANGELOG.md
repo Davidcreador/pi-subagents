@@ -2,6 +2,22 @@
 
 ## [Unreleased]
 
+## [0.34.0-bg.2] - 2026-07-16
+
+### Added
+- Added stable canonical `<runId>:<flatIndex>` child targets, optional parent-session handles, and the exact `send_message({ target, message })` tool for isolated active steering or validated persisted-session continuation.
+- Added `/agents`, an interactive current-session child browser with all-session history, live Pi transcript/tool rendering, keyboard navigation, and metadata-only persistence.
+
+### Changed
+- Made the compact parent-facing `subagent` description the default and taught both built-in descriptions to delegate selectively without waiting for explicit user syntax; explicit `full` and `custom` modes remain available.
+- Raised the runtime minimums to Node `>=22.19.0` and Pi `>=0.80.7`, with Pi runtime dependencies aligned to `0.80.7`.
+
+### Fixed
+- Hardened child-thread registry writes, continuation claims, stale updates, heartbeat leases, session ownership validation, worktree cwd continuity, and crash reconciliation across foreground, async, nested, and multi-process execution.
+- Stopped sending nonzero signals to PIDs recovered from persisted metadata and isolated shared unit-test fixtures for safe concurrent unit-suite runs.
+- Sanitized `/agents` transcript content, registry metadata, and validation errors before rendering so stored child output, paths, and labels cannot inject terminal control sequences.
+- Kept freshly launched async continuations waitable before their first `status.json` write, treated persisted terminal status as authoritative over stale tracker state, and disposed batched completion notifications cleanly on reload or session shutdown.
+
 ## [0.34.0-bg.1] (fork)
 
 ### Fixed

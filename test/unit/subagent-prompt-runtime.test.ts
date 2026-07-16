@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { writeSteerRequestToDir } from "../../src/runs/background/control-channel.ts";
+import { controlHeartbeatPath, hasFreshControlHeartbeat } from "../../src/runs/shared/control-heartbeat.ts";
 import {
 	SUBAGENT_CHILD_AGENT_ENV,
 	SUBAGENT_CHILD_INDEX_ENV,
@@ -97,7 +98,7 @@ afterEach(() => {
 function setSupervisorEnv(): void {
 	process.env[SUBAGENT_ORCHESTRATOR_TARGET_ENV] = "subagent-chat-parent";
 	process.env[SUBAGENT_ORCHESTRATOR_SESSION_ID_ENV] = "session-parent";
-	process.env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV] = path.join(os.tmpdir(), "subagent-supervisor-runtime-test");
+	process.env[SUBAGENT_SUPERVISOR_CHANNEL_DIR_ENV] = path.join(os.tmpdir(), `subagent-supervisor-runtime-test-${process.pid}`);
 	process.env[SUBAGENT_RUN_ID_ENV] = "run-123";
 	process.env[SUBAGENT_CHILD_AGENT_ENV] = "worker";
 	process.env[SUBAGENT_CHILD_INDEX_ENV] = "0";
@@ -157,6 +158,29 @@ describe("subagent prompt runtime", () => {
 			assert.match(sent[0]?.content ?? "", /Mid-run steering/);
 			assert.match(sent[0]?.content ?? "", /Focus on tests\./);
 			assert.deepEqual(fs.readdirSync(inbox).filter((entry) => entry.endsWith(".json")), []);
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("refreshes the foreground control lease from the child process", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "subagent-steering-heartbeat-"));
+		try {
+			const inbox = path.join(dir, "steer");
+			const token = "child-instance-token";
+			fs.mkdirSync(inbox, { recursive: true });
+			fs.writeFileSync(path.join(inbox, "active.json"), JSON.stringify({ version: 1, target: "run:0", pid: process.pid, startedAt: Date.now(), token }));
+			process.env[SUBAGENT_STEER_INBOX_ENV] = inbox;
+			const handlers = new Map<string, (payload?: unknown) => unknown>();
+			registerSubagentPromptRuntime({
+				on(event: string, handler: (payload?: unknown) => unknown) { handlers.set(event, handler); },
+				sendUserMessage() {},
+			} as { on(event: string, handler: (payload?: unknown) => unknown): void; sendUserMessage(): void });
+
+			handlers.get("message_start")?.({});
+			assert.equal(hasFreshControlHeartbeat(inbox, token, process.pid), true);
+			handlers.get("session_shutdown")?.({});
+			assert.equal(fs.existsSync(controlHeartbeatPath(inbox)), false);
 		} finally {
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
@@ -434,7 +458,9 @@ describe("subagent prompt runtime", () => {
 			setSessionName(name: string) {
 				sessionName = name;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void; setSessionName(name: string): void });
+			getAllTools() { return []; },
+			registerTool() {},
+		} as any);
 
 		await beforeAgentStart?.({ systemPrompt: BASE_PROMPT });
 
@@ -447,7 +473,9 @@ describe("subagent prompt runtime", () => {
 			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void });
+			getAllTools() { return []; },
+			registerTool() {},
+		} as any);
 
 		assert.ok(beforeAgentStart, "expected before_agent_start handler");
 		process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = "0";
@@ -466,7 +494,9 @@ describe("subagent prompt runtime", () => {
 			on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>) {
 				if (event === "before_agent_start") beforeAgentStart = handler;
 			},
-		} as { on(event: string, handler: (payload: { systemPrompt: string }) => Promise<{ systemPrompt: string } | undefined>): void });
+			getAllTools() { return []; },
+			registerTool() {},
+		} as any);
 
 		process.env.PI_SUBAGENT_INHERIT_PROJECT_CONTEXT = "1";
 		process.env.PI_SUBAGENT_INHERIT_SKILLS = "1";

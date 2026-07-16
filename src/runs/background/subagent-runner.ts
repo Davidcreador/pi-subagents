@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -93,6 +94,9 @@ import { waitForImportedAsyncRoot } from "./chain-root-attachment.ts";
 import { appendRunnerStepsToStatus, consumeChainAppendRequests, countPendingChainAppendRequests } from "./chain-append.ts";
 import { appendTurnBudgetSystemPrompt, formatTurnBudgetOutput, initialTurnBudgetState, shouldAbortForTurnBudget, turnBudgetExceededMessage, turnBudgetSoftNote, turnBudgetState } from "../shared/turn-budget.ts";
 import { initialToolBudgetState, toolBudgetState } from "../shared/tool-budget.ts";
+import { childTarget } from "../shared/child-identity.ts";
+import { ChildThreadRegistry } from "../shared/child-thread-registry.ts";
+import { writeControlHeartbeat } from "../shared/control-heartbeat.ts";
 
 interface SubagentRunConfig {
 	id: string;
@@ -107,8 +111,10 @@ interface SubagentRunConfig {
 	artifactConfig?: Partial<ArtifactConfig>;
 	share?: boolean;
 	sessionDir?: string;
+	trustedSessionRoot?: string;
 	asyncDir: string;
 	sessionId?: string | null;
+	parentThreadSessionId?: string;
 	piPackageRoot?: string;
 	piArgv1?: string;
 	worktreeSetupHook?: string;
@@ -133,6 +139,8 @@ interface SubagentRunConfig {
 interface StepResult {
 	agent: string;
 	output: string;
+	childTarget?: string;
+	handle?: string;
 	error?: string;
 	success: boolean;
 	exitCode?: number | null;
@@ -788,6 +796,8 @@ async function runSingleStep(
 ): Promise<{
 	agent: string;
 	output: string;
+	childTarget?: string;
+	handle?: string;
 	exitCode: number | null;
 	error?: string;
 	model?: string;
@@ -1142,6 +1152,8 @@ async function runSingleStep(
 	return {
 		agent: step.agent,
 		output: outputForSummary,
+		childTarget: step.childTarget ?? `${ctx.id}:${ctx.flatIndex}`,
+		...(step.handle ? { handle: step.handle } : {}),
 		exitCode: effectiveFinalExitCode,
 		error: effectiveFinalError,
 		sessionFile: step.sessionFile,
@@ -1333,11 +1345,13 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	let interrupted = false;
 	let currentActivityState: ActivityState | undefined;
 	let activityTimer: NodeJS.Timeout | undefined;
+	let controlHeartbeatTimer: NodeJS.Timeout | undefined;
 	let timeoutTimer: NodeJS.Timeout | undefined;
 	let timedOut = false;
 	let turnBudgetExceeded = false;
 	const timeoutMessage = config.timeoutMs !== undefined ? `Subagent timed out after ${config.timeoutMs}ms.` : undefined;
 	const timeoutAbortController = new AbortController();
+	const controlToken = randomUUID();
 	let previousCumulativeTokens: TokenUsage = { input: 0, output: 0, total: 0 };
 	let latestSessionFile: string | undefined;
 
@@ -1355,11 +1369,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				const transcriptPath = resolveAsyncStepTranscriptPath({ artifactsDir, artifactConfig, runId: id, agent: task.agent, flatIndex: taskFlatIndex, flatStepCount: initialFlatStepCount });
 				initialStatusSteps.push({
 					agent: task.agent,
+					childTarget: task.childTarget ?? `${id}:${taskFlatIndex}`,
+					...(task.handle ? { handle: task.handle } : {}),
 					phase: task.phase,
 					label: task.label,
 					outputName: task.outputName,
 					structured: task.structured,
 					status: "pending",
+					cwd: path.resolve(cwd, task.cwd ?? "."),
 					...(task.toolBudget ? { toolBudget: initialToolBudgetState(task.toolBudget) } : {}),
 					...(task.sessionFile ? { sessionFile: task.sessionFile } : {}),
 					...(transcriptPath ? { transcriptPath } : {}),
@@ -1391,11 +1408,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const transcriptPath = resolveAsyncStepTranscriptPath({ artifactsDir, artifactConfig, runId: id, agent: step.agent, flatIndex: stepFlatIndex, flatStepCount: initialFlatStepCount });
 			initialStatusSteps.push({
 				agent: step.agent,
+				childTarget: step.childTarget ?? `${id}:${stepFlatIndex}`,
+				...(step.handle ? { handle: step.handle } : {}),
 				phase: step.phase,
 				label: step.label,
 				outputName: step.outputName,
 				structured: step.structured,
 				status: "pending",
+				cwd: path.resolve(cwd, step.cwd ?? "."),
 				...(step.toolBudget ? { toolBudget: initialToolBudgetState(step.toolBudget) } : {}),
 				...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 				...(transcriptPath ? { transcriptPath } : {}),
@@ -1426,6 +1446,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		...(config.turnBudget ? { turnBudget: initialTurnBudgetState(config.turnBudget) } : {}),
 		...(config.toolBudget ? { toolBudget: initialToolBudgetState(config.toolBudget) } : {}),
 		pid: process.pid,
+		controlToken,
 		cwd,
 		currentStep: 0,
 		chainStepCount: steps.length,
@@ -1438,6 +1459,15 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 	};
 
 	fs.mkdirSync(asyncDir, { recursive: true });
+	try {
+		writeControlHeartbeat(asyncDir, controlToken);
+		controlHeartbeatTimer = setInterval(() => {
+			try { writeControlHeartbeat(asyncDir, controlToken); } catch { /* steering lease becomes unavailable */ }
+		}, 1_000);
+		controlHeartbeatTimer.unref?.();
+	} catch {
+		controlHeartbeatTimer = undefined;
+	}
 	writeAtomicJson(statusPath, statusPayload);
 	const emitNestedSelfEvent = (type: "subagent.nested.updated" | "subagent.nested.completed"): void => {
 		if (!config.nestedRoute || !config.nestedSelf) return;
@@ -1551,7 +1581,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			const nestedAsyncDir = run.asyncDir ?? resolveNestedAsyncDir(config.nestedRoute.rootRunId, run);
 			if (!nestedAsyncDir) continue;
 			try {
-				deliverInterruptRequest({ asyncDir: nestedAsyncDir, pid: run.pid, source: "ancestor-interrupt" });
+				deliverInterruptRequest({ asyncDir: nestedAsyncDir, source: "ancestor-interrupt" });
 			} catch (error) {
 				appendJsonl(eventsPath, JSON.stringify({
 					type: "subagent.nested.interrupt_failed",
@@ -2105,6 +2135,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 
 		if (isDynamicRunnerGroup(step)) {
 			const groupStartFlatIndex = flatIndex;
+			const canonicalStartIndex = step.startIndex ?? groupStartFlatIndex;
 			let materialized: ReturnType<typeof materializeDynamicParallelStep>;
 			try {
 				materialized = materializeDynamicParallelStep(step as Parameters<typeof materializeDynamicParallelStep>[0], outputs, stepIndex, { maxItems: config.dynamicFanoutMaxItems, allowRunnerFields: true });
@@ -2189,6 +2220,23 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				continue;
 			}
 
+			if (config.parentThreadSessionId) {
+				const registry = new ChildThreadRegistry();
+				registry.registerMany(materialized.parallel.map((task, itemIndex) => ({
+					originalTarget: childTarget(id, canonicalStartIndex + itemIndex),
+					handle: task.handle,
+					parentSessionId: config.parentThreadSessionId!,
+					runId: id,
+					index: canonicalStartIndex + itemIndex,
+					state: "queued" as const,
+					cwd: path.resolve(cwd, task.cwd ?? "."),
+					agent: task.agent,
+					sessionFile: step.sessionFiles?.[itemIndex],
+					asyncDir,
+					trustedSessionRoot: config.trustedSessionRoot,
+				})));
+			}
+
 			const dynamicSteps = materialized.parallel.map((task, itemIndex) => {
 				const thinkingOverride = step.thinkingOverrides?.[itemIndex];
 				const model = thinkingOverride ? applyThinkingSuffix(step.parallel.model, thinkingOverride, true) : step.parallel.model;
@@ -2197,6 +2245,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					...step.parallel,
 					task: task.task ?? step.parallel.task,
 					label: task.label ?? step.parallel.label,
+					handle: task.handle ?? step.parallel.handle,
+					childTarget: `${id}:${canonicalStartIndex + itemIndex}`,
 					...(step.sessionFiles?.[itemIndex] ? { sessionFile: step.sessionFiles[itemIndex] } : {}),
 					...(thinkingOverride ? {
 						...(model ? { model } : {}),
@@ -2212,11 +2262,14 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				const transcriptPath = resolveAsyncStepTranscriptPath({ artifactsDir, artifactConfig, runId: id, agent: task.agent, flatIndex: groupStartFlatIndex + itemIndex, flatStepCount: dynamicFlatStepCount });
 				return {
 					agent: task.agent,
+					childTarget: task.childTarget,
+					...(task.handle ? { handle: task.handle } : {}),
 					phase: task.phase ?? step.phase,
 					label: task.label,
 					outputName: undefined,
 					structured: Boolean(task.structuredOutputSchema),
 					status: "pending",
+					cwd: path.resolve(cwd, task.cwd ?? "."),
 					...(task.sessionFile ? { sessionFile: task.sessionFile } : {}),
 					...(transcriptPath ? { transcriptPath } : {}),
 					skills: task.skills,
@@ -2291,6 +2344,7 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				}
 				const taskStartTime = Date.now();
 				statusPayload.currentStep = fi;
+				statusPayload.steps[fi].cwd = path.resolve(cwd, task.cwd ?? ".");
 				statusPayload.steps[fi].status = "running";
 				statusPayload.steps[fi].error = undefined;
 				statusPayload.steps[fi].activityState = undefined;
@@ -2371,6 +2425,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 				results.push({
 					agent: pr.agent,
 					output: pr.output,
+					childTarget: pr.childTarget,
+					handle: pr.handle,
 					error: pr.error,
 					success: pr.interrupted !== true && pr.exitCode === 0,
 					exitCode: pr.interrupted === true ? 0 : pr.exitCode,
@@ -2566,7 +2622,9 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						}
 
 						const taskStartTime = Date.now();
+						const { taskForRun, taskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 						statusPayload.currentStep = fi;
+						statusPayload.steps[fi].cwd = path.resolve(taskCwd, taskForRun.cwd ?? ".");
 						statusPayload.steps[fi].status = "running";
 						statusPayload.steps[fi].error = undefined;
 						statusPayload.steps[fi].activityState = undefined;
@@ -2587,7 +2645,6 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 						const taskSessionDir = config.sessionDir
 							? path.join(config.sessionDir, `parallel-${taskIdx}`)
 							: undefined;
-						const { taskForRun, taskCwd } = prepareParallelTaskRun(task, cwd, worktreeSetup, taskIdx);
 						flushPendingStepSteers(fi);
 
 						const singleResult = await runSingleStep(taskForRun, {
@@ -2700,6 +2757,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 					results.push({
 						agent: pr.agent,
 						output: pr.output,
+						childTarget: pr.childTarget,
+						handle: pr.handle,
 						error: pr.error,
 						success: pr.interrupted !== true && pr.exitCode === 0,
 						exitCode: pr.interrupted === true ? 0 : pr.exitCode,
@@ -2817,6 +2876,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			previousOutput = singleResult.output;
 			results.push({
 				agent: singleResult.agent,
+				childTarget: singleResult.childTarget,
+				handle: singleResult.handle,
 				output: timedOut ? (timeoutMessage ?? "Subagent timed out.") : singleResult.output,
 				error: timedOut ? (timeoutMessage ?? "Subagent timed out.") : singleResult.error,
 				success: !timedOut && singleResult.interrupted !== true && singleResult.exitCode === 0,
@@ -2999,6 +3060,10 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 		clearInterval(activityTimer);
 		activityTimer = undefined;
 	}
+	if (controlHeartbeatTimer) {
+		clearInterval(controlHeartbeatTimer);
+		controlHeartbeatTimer = undefined;
+	}
 	if (timeoutTimer) {
 		clearTimeout(timeoutTimer);
 		timeoutTimer = undefined;
@@ -3081,6 +3146,8 @@ async function runSubagent(config: SubagentRunConfig): Promise<void> {
 			...(timedOut ? { timedOut: true, error: timeoutMessage ?? "Subagent timed out." } : turnBudgetExceeded ? { error: statusPayload.error ?? "Subagent exceeded turn budget." } : {}),
 			results: results.map((r) => ({
 				agent: r.agent,
+				childTarget: r.childTarget,
+				handle: r.handle,
 				output: r.output,
 				error: r.error,
 				success: r.success,

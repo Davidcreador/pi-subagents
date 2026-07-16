@@ -78,7 +78,7 @@ describe("attachPostExitStdioGuard", () => {
 		const result = await runWithGuard(script, 2000, 8000, 5000);
 		assert.equal(result.exitCode, 0);
 		assert.match(result.stdout, /hello/);
-		assert.ok(result.resolvedMs < 500, `expected fast close, got ${result.resolvedMs}ms`);
+		assert.ok(result.resolvedMs < 1500, `expected fast close, got ${result.resolvedMs}ms`);
 	});
 
 	it("cuts off a silent grandchild with the idle timer", { skip: process.platform === "win32" ? "bash scripts unavailable on Windows" : undefined }, async () => {

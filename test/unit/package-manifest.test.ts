@@ -44,6 +44,17 @@ test("direct @earendil-works runtime imports are declared for CI installs", () =
 	assert.deepEqual(missing, []);
 });
 
+test("requires the supported Node and Pi package versions", () => {
+	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
+
+	assert.equal(packageJson.engines?.node, ">=22.19.0");
+	assert.equal(packageJson.dependencies?.["@earendil-works/pi-tui"], "0.80.7");
+	for (const name of ["@earendil-works/pi-agent-core", "@earendil-works/pi-ai", "@earendil-works/pi-coding-agent"]) {
+		assert.equal(packageJson.devDependencies?.[name], "0.80.7");
+		assert.equal(packageJson.peerDependencies?.[name], ">=0.80.7");
+	}
+});
+
 test("direct dependency declarations are exact version pins", () => {
 	const packageJson = JSON.parse(fs.readFileSync(path.join(projectRoot, "package.json"), "utf-8"));
 
